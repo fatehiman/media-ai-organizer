@@ -1,0 +1,26 @@
+# Media Organizer — runtime dependencies
+# All licenses compatible with offline redistribution.
+
+# ONNX inference (GPU + CPU). onnxruntime-gpu transparently falls back to CPU
+# when no CUDA device / DLL is available.
+onnxruntime-gpu>=1.17,<2.0
+
+# Image decoding & preprocessing
+pillow>=10.2
+pillow-heif>=0.16          # HEIC/HEIF support
+opencv-python>=4.9
+
+# Audio analysis
+librosa>=0.10
+soundfile>=0.12
+numpy>=1.26,<2.1
+
+# OCR (calls bundled tesseract.exe)
+pytesseract>=0.3.10
+
+# Progress bars
+tqdm>=4.66
+
+# Build-time only (kept here so a single `pip install -r requirements.txt`
+# inside the dev env produces the exe). Comment out if you split dev/runtime.
+pyinstaller>=6.4

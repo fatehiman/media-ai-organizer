@@ -1,0 +1,60 @@
+# =============================================================================
+#  Media Organizer  —  .gitignore
+# -----------------------------------------------------------------------------
+#  Strategy: keep source, scripts, models (24 MB total), conf, README,
+#  tech-ref.md.  Exclude anything that pushes us over GitHub's 100 MB
+#  per-file limit, anything reproducible from a `pip install`, and any
+#  user-data artifacts (move logs).  Setup instructions for the excluded
+#  pieces live in tech-ref.md.
+# =============================================================================
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtualenvs (rebuild via `pip install -r requirements.txt`) -----------
+.venv/
+venv/
+env/
+
+# --- PyInstaller artifacts (rebuild via scripts/build.ps1) -----------------
+build/
+dist/
+*.spec
+warn-*.txt
+xref-*.html
+
+# --- Bundled binaries (large; install per tech-ref.md) ---------------------
+# Tesseract is ~239 MB and one DLL is 97 MB.  Install via winget or copy
+# from "C:\Program Files\Tesseract-OCR\".
+third_party/tesseract/
+# ffmpeg is optional (cv2 covers most codecs); if you add a portable build,
+# put it under third_party/ffmpeg/ and uncomment the next line.
+third_party/ffmpeg/
+
+# --- Move logs (user data) -------------------------------------------------
+*.log
+run.log
+*.log.*
+media-organizer-move.log
+media-organizer-move.log.*
+
+# --- IDE / OS clutter ------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Local config backups --------------------------------------------------
+*.conf.bak
+*.conf.local
+
+# --- Misc ------------------------------------------------------------------
+.env
+*.tmp
+*.swp
+
+# --- Local sandbox copies of the conf inside dist/ -------------------------
+# (covered by dist/ above; mentioning here as a reminder)
