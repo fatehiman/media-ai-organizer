@@ -23,6 +23,7 @@ env/
 build/
 dist/
 *.spec
+!scripts/media-organizer.spec
 warn-*.txt
 xref-*.html
 

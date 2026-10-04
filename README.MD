@@ -5,6 +5,14 @@ their content using local AI models, and **moves** them into a tidy folder
 structure under a target directory. Fully offline, GPU-accelerated when a
 CUDA GPU is present, falls back to CPU automatically.
 
+Two programs in one portable folder:
+
+- `media-organizer.exe` — the CLI: sorts a whole folder tree (images,
+  videos, audio) as shown below.
+- `media-organizer-gui.exe` — a window to **convert / shrink images**
+  (to JPG or PNG) and optionally sort them into category folders. See
+  [GUI: convert & categorize](#gui-convert--categorize).
+
 ```
 target/
 ├── images/
@@ -76,7 +84,7 @@ For developers building from source, see
 
 ### Run the portable .exe
 
-1. Download or build `MediaOrganizer/` (a portable folder, ~1.8 GB).
+1. Download or build `MediaOrganizer/` (a portable folder, ~1.6 GB).
 2. Edit `MediaOrganizer\media-organizer.conf`:
    ```
    source = D:\Photos\Unsorted
@@ -95,7 +103,58 @@ For developers building from source, see
 If the run is killed mid-move (power loss, Ctrl-C, BSOD), launch the app
 again — it will offer to resume from where it stopped.
 
+## GUI: convert & categorize
+
+Double-click `media-organizer-gui.exe`.
+
+```
+┌ Source ───────────┐ ┌ Options ─────────────┐ ┌ Target ───────────┐
+│ folder [Browse]   │ │ Resize: keep / % /   │ │ folder [Browse]   │
+│ IMG_0001.HEIC     │ │   width / height     │ │ personal\a.jpg    │
+│ IMG_0002.PNG      │ │ Format: JPG / PNG    │ │ objects\b.jpg     │
+│ ...               │ │   JPG quality 1-100  │ │ ...               │
+│ [ ] subfolders    │ │ [ ] Move (del source)│ │ [Refresh]         │
+│                   │ │ [ ] Auto categorize  │ │                   │
+│                   │ │     [x] personal ... │ │                   │
+│                   │ │ [Preview] [Convert]  │ │                   │
+└───────────────────┘ └──────────────────────┘ └───────────────────┘
+ Log: IMG_0001.HEIC -> personal\IMG_0001.jpg  2.4 MB -> 310 KB (13%)
+```
+
+- **Left pane**: the source folder and its images (JPG, PNG, HEIC, WEBP,
+  … — the `ext-image` list of the conf). Tick *Include subfolders* to list
+  images in subfolders too.
+- **Right pane**: the target folder. Double-click a file to open it.
+- **Resize**: *Keep size*, *Percent*, *Width* or *Height* in pixels. The
+  aspect ratio is always kept, and images are **never enlarged**.
+- **Target format**: JPG (with a quality slider) or PNG.
+- **Move (del source)**: after each file is converted and saved, its
+  source goes to the Recycle Bin (no prompt). This happens file by file,
+  not at the end. On drives without a Recycle Bin (some USB sticks,
+  network shares) Windows deletes the file permanently.
+- **Auto categorize**: sorts the output into `target\<category>\`. Only
+  ticked categories are used; an image whose category is not ticked goes
+  to `target\other\`. Without *Auto categorize*, files go straight into
+  the target folder.
+- **Preview**: converts the selected image (double-click works too) and
+  shows it at **1:1 size**, not shrunk to the screen, so you see the real
+  result resolution and JPG quality. Scroll or drag to pan; `Esc` closes.
+  The overlay shows `original -> converted` size, file size with percent,
+  and the detected category.
+- **Convert**: works on the selected images, or on all of them when none
+  is selected. *Stop* stops after the current file.
+
+Per file the order is: convert in memory → detect the category on the
+small converted image (faster than on the big original) → save → recycle
+the source. The source's metadata is read **before** converting, so
+screenshot detection still works. The output keeps the EXIF data (camera,
+date, GPS), the color profile and the file's modified date. Name
+collisions get a ` (2)` suffix. Settings are remembered in
+`%APPDATA%\MediaOrganizer\gui.json`.
+
 ## CLI flags
+
+These apply to `media-organizer.exe` only.
 
 ```
 media-organizer.exe                 # full run (dry-run if config says so)

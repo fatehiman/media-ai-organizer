@@ -122,7 +122,7 @@ $env:PYTHONPATH = "src"
 powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
-Output: `dist\MediaOrganizer\` (~1.8 GB unzipped with Tesseract). Copy
+Output: `dist\MediaOrganizer\` (~1.6 GB unzipped with Tesseract). Copy
 that folder anywhere — fully portable.
 
 ---
@@ -339,10 +339,58 @@ were worse than 0.5.
 - The build script renames `dist/media-organizer/` → `dist/MediaOrganizer/`
   and copies `models/`, `third_party/`, `media-organizer.conf`, and
   `README.MD` next to the exe.
-- The PyInstaller entry point is `src/run_media_organizer.py` (a
-  thin launcher), NOT `src/media_organizer/__main__.py`. PyInstaller
-  doesn't preserve the parent package when bundling a `__main__.py`,
-  which breaks relative imports.
+- The PyInstaller entry points are `src/run_media_organizer.py` (CLI)
+  and `src/run_media_organizer_gui.py` (GUI) — thin launchers, NOT
+  `src/media_organizer/__main__.py`. PyInstaller doesn't preserve the
+  parent package when bundling a `__main__.py`, which breaks relative
+  imports.
+- Both exes live in the same folder and share `_internal/` (one
+  `COLLECT` with two `EXE`s in `scripts/media-organizer.spec`), so the
+  GUI adds only a few MB instead of a second ~800 MB copy.
+
+---
+
+## GUI (`gui.py`, `convert.py`, `trash.py`)
+
+- **Toolkit**: Tkinter (ships with Python, ~10 MB in the bundle).
+- **Threading**: all work (decode, convert, CLIP, file writes) runs in
+  one worker thread; it talks to the UI only through a `queue.Queue`
+  polled with `after(100)`. Tk variables must never be read from the
+  worker — e.g. the ticked categories are copied into a `set` in the UI
+  thread before the worker starts ("main thread is not in main loop"
+  otherwise).
+- **Don't name methods like Tk internals**: a method called `_options`
+  on the `tk.Tk` subclass broke `columnconfigure` (Tk calls
+  `self._options(cnf, kw)` internally).
+- **Models**: CLIP is loaded lazily on the first categorize / preview with
+  *Auto categorize* on. ONNX gets `cpu_count` intra-op threads, because
+  the GUI uses one process.
+- **Conversion** (`convert.py`):
+  - target size: percent / width / height, aspect kept, `scale <= 1`
+    (never enlarged);
+  - JPEG decode uses `Image.draft` at the target size (much faster for
+    big photos); the draft size is given in stored orientation, so width
+    and height swap for EXIF orientations 5–8;
+  - EXIF is copied with Orientation set to 1 (pixels are already
+    rotated); ICC profile copied (iPhone HEIC is Display P3); mtime and
+    atime copied with `os.utime`;
+  - transparent images: kept as RGBA in PNG, flattened on white for JPG;
+  - written to `<name>.part` then `os.replace` + fsync, so a crash never
+    leaves a half file under the real name.
+- **Categorize after convert**: the classifier runs on the converted
+  pixels (thumbnailed to 1024 px), but with `ImageMeta` read from the
+  **source** file, because the screenshot / camera signals live in EXIF
+  and XMP that a format change may drop.
+- **Recycle Bin** (`trash.py`): `SHFileOperationW` with
+  `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI` via
+  ctypes; `pFrom` must end with a double NUL. On a volume without a
+  Recycle Bin Windows deletes permanently. The source is recycled only
+  after its output was written successfully.
+- **Settings**: `%APPDATA%\MediaOrganizer\gui.json`.
+- **Config**: the GUI loads `media-organizer.conf` with
+  `require_paths=False` (it picks its own folders). Category checkboxes
+  are the `image-<folder>` names; unticked / low-confidence →
+  `fallback-folder`.
 
 ---
 
@@ -379,22 +427,24 @@ were worse than 0.5.
 1. Preflight-checks `models/` are present.
 2. Calls **the venv's** `pyinstaller.exe`, not whatever `pyinstaller` is
    on PATH (system Python finds nothing because deps aren't there).
-3. Entry point is `src/run_media_organizer.py`.
-4. PyInstaller flags include hidden-import declarations for
-   `onnxruntime`, `pytesseract`, `pillow_heif`, `cv2` and `--collect-*`
-   flags for librosa, soundfile, pillow_heif, onnxruntime.
-5. Renames `dist/media-organizer/` → `dist/MediaOrganizer/` and copies
+3. Builds from `scripts/media-organizer.spec` (committed; the
+   `.gitignore` has an exception for it). The spec has two `Analysis`
+   blocks (CLI, GUI) with the same hidden imports (`onnxruntime`,
+   `pytesseract`, `pillow_heif`, `tokenizers`, `cv2`) and collected data
+   for librosa, soundfile, pillow_heif, onnxruntime. The GUI exe is
+   built with `console=False`.
+4. Renames `dist/media-organizer/` → `dist/MediaOrganizer/` and copies
    conf + models + third_party + README next to the exe.
 
 Approximate sizes:
 
 | Artifact | Size |
 |---|---|
-| `media-organizer.exe` | 33 MB |
-| `_internal/` | 1.1 GB (mostly onnxruntime CUDA DLLs) |
+| `media-organizer.exe` + `media-organizer-gui.exe` | 18 MB each |
+| `_internal/` | ~800 MB (mostly onnxruntime CUDA DLLs; torch excluded in the spec) |
 | `models/` | ~600 MB (CLIP 580 MB) |
 | `third_party/tesseract/` | 239 MB (optional) |
-| **Total** | ~1.8 GB |
+| **Total** | ~1.6 GB |
 
 To shrink to ~150 MB, swap `onnxruntime-gpu` → `onnxruntime` in
 `requirements.txt` (loses GPU support).

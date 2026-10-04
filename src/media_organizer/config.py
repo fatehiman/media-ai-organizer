@@ -110,7 +110,9 @@ class Config:
         return "unknown"
 
 
-def load(config_path: Path | str) -> Config:
+def load(config_path: Path | str, *, require_paths: bool = True) -> Config:
+    """Parse the config file.  The GUI picks its own folders, so it passes
+    require_paths=False and `source` / `target` may then be missing."""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -134,12 +136,12 @@ def load(config_path: Path | str) -> Config:
     # -- Required paths ----------------------------------------------------
     source = get("source")
     target = get("target")
-    if not source or not target:
+    if require_paths and (not source or not target):
         raise ValueError("Config must define both 'source' and 'target' paths")
 
     cfg = Config(
-        source=Path(source).expanduser(),
-        target=Path(target).expanduser(),
+        source=Path(source or ".").expanduser(),
+        target=Path(target or ".").expanduser(),
     )
 
     # -- Behavior ----------------------------------------------------------

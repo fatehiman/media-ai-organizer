@@ -2,7 +2,8 @@
 #  Build Media Organizer (portable Windows folder)
 # -----------------------------------------------------------------------------
 #  Produces: dist\MediaOrganizer\
-#       media-organizer.exe          (entry point)
+#       media-organizer.exe          (CLI entry point)
+#       media-organizer-gui.exe      (GUI: convert / resize / categorize)
 #       _internal\                   (PyInstaller deps)
 #       media-organizer.conf         (default config)
 #       models\                      (ONNX models, incl. models\clip\)
@@ -69,37 +70,18 @@ Get-ChildItem -Filter "*.spec" | Remove-Item -Force -ErrorAction SilentlyContinu
 
 # ---- run PyInstaller (from the venv, not from the system Python) ------------
 
-$entry = "src\run_media_organizer.py"
+$spec = "scripts\media-organizer.spec"
 $venvPyInst = Join-Path $repoRoot ".venv\Scripts\pyinstaller.exe"
-$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPyInst)) {
     Write-Host "`nVenv pyinstaller not found at $venvPyInst." -ForegroundColor Red
     Write-Host "Run:  .\.venv\Scripts\python.exe -m pip install pyinstaller" -ForegroundColor Yellow
     exit 1
 }
-Write-Host "`nRunning PyInstaller from venv..." -ForegroundColor Cyan
+Write-Host "`nRunning PyInstaller from venv (CLI + GUI, see $spec)..." -ForegroundColor Cyan
 
-& $venvPyInst `
-    --name media-organizer `
-    --onedir `
-    --noconfirm `
-    --clean `
-    --console `
-    --paths src `
-    --collect-submodules librosa `
-    --collect-submodules onnxruntime `
-    --collect-data librosa `
-    --collect-data soundfile `
-    --collect-data pillow_heif `
-    --collect-binaries onnxruntime `
-    --collect-data onnxruntime `
-    --hidden-import onnxruntime `
-    --hidden-import onnxruntime.capi._pybind_state `
-    --hidden-import pytesseract `
-    --hidden-import pillow_heif `
-    --hidden-import tokenizers `
-    --hidden-import cv2 `
-    $entry
+# The spec builds media-organizer.exe (console) and media-organizer-gui.exe
+# (windowed) into one folder that shares _internal\.
+& $venvPyInst --noconfirm --clean $spec
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "PyInstaller failed." -ForegroundColor Red
@@ -123,4 +105,5 @@ Copy-Item -Recurse -Path "third_party"   -Destination $finalDir
 
 Write-Host "`nBuild complete." -ForegroundColor Green
 Write-Host "Output: $finalDir"
-Write-Host "Run:    $finalDir\media-organizer.exe"
+Write-Host "Run:    $finalDir\media-organizer.exe       (CLI)"
+Write-Host "        $finalDir\media-organizer-gui.exe   (GUI)"

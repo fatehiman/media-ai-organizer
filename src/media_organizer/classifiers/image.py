@@ -307,7 +307,21 @@ def classify(path: Path, cfg: Config) -> ImageResult:
     except Exception as e:
         return ImageResult(path=path, folder="unknown", confidence=0.0,
                            tags=["decode_error"], error=f"decode: {e}")
+    return classify_loaded(path, img, meta, cfg)
 
+
+def read_meta(path: Path, img: Image.Image) -> ImageMeta:
+    """Metadata signals of a freshly opened (not yet transposed or
+    converted) image.  Read it from the source file: conversion may lose
+    the EXIF / XMP fields it looks at."""
+    return _read_meta(path, img)
+
+
+def classify_loaded(
+    path: Path, img: Image.Image, meta: ImageMeta, cfg: Config
+) -> ImageResult:
+    """Classify an image that is already decoded (RGB, EXIF-oriented).
+    `meta` should come from the original file (see read_meta)."""
     if cfg.screenshot_metadata and meta.screenshot:
         folder = _folder_of(cfg.screenshot_content_type, cfg.image_folders)
         if folder is not None:
