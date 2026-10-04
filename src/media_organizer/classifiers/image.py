@@ -2,27 +2,29 @@
 Image classifier.
 
 Pipeline per file:
-  1. Decode (HEIC/HEIF supported via pillow_heif).
-  2. EXIF-orient + center-crop + resize to 224x224.
-  3. ONNX MobileNetV3-Large -> 1000-class softmax probabilities.
-  4. OCR pass via Tesseract (always on).
-  5. Face detection (Haar cascades, frontal + profile + mirror).
-  6. Aggregate per content type:
-       - keyword-driven types: sum probs of classes whose name contains any
-         configured keyword (substring, case-insensitive).
-       - 'paper': max(OCR-driven score, blank-paper-heuristic score).
-       - 'human': boosted to face-boost if a face was found.
-  7. Aggregate per folder (sum of its content-type scores).
-  8. Winner = max-scoring folder; if max < unknown_threshold -> 'unknown'.
+  1. Decode (HEIC/HEIF supported via pillow_heif) and read metadata.
+  2. Screenshot metadata: iOS writes EXIF UserComment "Screenshot", Android
+     names files "Screenshot_...".  A hit routes straight to the screenshot
+     content type; no model runs.
+  3. CLIP ViT-B/32 zero-shot -> probability per content type, from the
+     `prompts-<type>` lines in the config (see clip.py).
+  4. Metadata adjustments:
+       - camera EXIF (Make) present -> it is a camera photo, so the
+         screenshot score is zeroed;
+       - no camera EXIF and phone-shaped (>= 1.9:1) -> screenshot boosted.
+  5. Face detection (YuNet).  A face scoring >= face-min-score adds
+     face-boost to the face-target content type.  Cartoon faces on toys and
+     cookies score lower than real faces, so the threshold filters them.
+  6. Optional OCR boost for the document type (ocr-boost > 0).
+  7. Aggregate per folder (sum of its content-type scores).  Winner = max;
+     if max < unknown-threshold -> fallback folder.
 
 Returns an ImageResult with chosen folder + confidence + a `tags` list of
-human-readable reasons that explain the decision (face detected, top
-ImageNet class, OCR word count, blank-paper score, etc.).
+human-readable reasons that explain the decision.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -39,16 +41,14 @@ except Exception:
     pass
 
 from ..config import Config
-from ..runtime import get_session, models_dir
+from ..runtime import models_dir
+from . import clip
 from . import ocr as ocr_module
 
 
 # --- Face detection ----------------------------------------------------------
-# ImageNet has no "person" class — when shown a photo of a human the model
-# fires on clothing / accessories / scene objects (drumstick, neck brace,
-# bow tie, academic gown, wig, ...).  So we run a face detector in parallel;
-# a positive face hit forces the configured face-target content type to a
-# high score regardless of what ImageNet picked.
+# CLIP alone often calls a selfie in a dark room "a dark photo", or a group
+# far away "a street".  A real detected face is a strong extra signal.
 #
 # Primary detector: YuNet (DNN, 2022) — bundled in OpenCV >= 4.5.4 via
 # cv2.FaceDetectorYN_create.  ~232 KB ONNX, far better precision than Haar
@@ -58,10 +58,9 @@ from . import ocr as ocr_module
 _YUNET_DETECTOR = None
 _YUNET_FAILED = False
 _FACE_CASCADES: Optional[List[cv2.CascadeClassifier]] = None
-_YUNET_SCORE_THRESHOLD = 0.7
 
 
-def _yunet_detector():
+def _yunet_detector(score_threshold: float):
     """Lazily build the YuNet detector; cache one per process.  Returns None
     if the model file is missing or YuNet isn't available in this cv2 build.
     """
@@ -79,7 +78,7 @@ def _yunet_detector():
             str(model),
             "",
             (320, 320),                   # placeholder; set per image
-            score_threshold=_YUNET_SCORE_THRESHOLD,
+            score_threshold=score_threshold,
             nms_threshold=0.3,
             top_k=5000,
         )
@@ -110,8 +109,8 @@ def _face_cascades() -> List[cv2.CascadeClassifier]:
     return _FACE_CASCADES
 
 
-def _detect_faces_yunet(img: Image.Image) -> int:
-    det = _yunet_detector()
+def _detect_faces_yunet(img: Image.Image, score_threshold: float) -> int:
+    det = _yunet_detector(score_threshold)
     if det is None:
         return -1   # signal: YuNet unavailable, caller should fall back
     try:
@@ -157,138 +156,73 @@ def _detect_faces_haar(img: Image.Image) -> int:
         return 0
 
 
-def _detect_faces(img: Image.Image) -> int:
-    """Return number of detected faces.  Tries YuNet first, falls back to Haar."""
-    n = _detect_faces_yunet(img)
+def _detect_faces(img: Image.Image, score_threshold: float) -> int:
+    """Return number of faces scoring >= score_threshold.  Tries YuNet
+    first, falls back to Haar."""
+    n = _detect_faces_yunet(img, score_threshold)
     if n >= 0:
         return n
     return _detect_faces_haar(img)
 
 
-# --- Blank / rectangular paper heuristic -------------------------------------
-# Detects pages, bills, receipts and similar mostly-text-on-white-paper
-# images that may not OCR cleanly (e.g. handwriting, low contrast, foreign
-# script).  Signal:
-#     * High mean luminance (mostly bright pixels)
-#     * Low color saturation (mostly grey/black/white)
-#     * Smooth interior (low pixel variance), to exclude bright nature shots
-# All thresholds picked to avoid firing on snow scenes, blue sky photos,
-# overexposed selfies, etc.
+# --- Metadata ----------------------------------------------------------------
 
-def _blank_paper_score(img: Image.Image) -> float:
+_EXIF_MAKE = 271
+_EXIF_IFD = 0x8769
+_EXIF_USER_COMMENT = 37510
+_TALL_RATIO = 1.9            # phone screens are 19.5:9 (2.17); photos <= 16:9
+
+
+@dataclass
+class ImageMeta:
+    screenshot: bool          # metadata says "this is a screenshot"
+    camera: bool              # has a camera Make -> taken by a camera
+    tall: bool                # phone-screen aspect ratio
+
+
+def _read_meta(path: Path, img: Image.Image) -> ImageMeta:
+    camera = False
+    comment = ""
     try:
-        w, h = img.size
-        if max(w, h) > 600:
-            scale = 600.0 / max(w, h)
-            img_small = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-        else:
-            img_small = img
-        rgb = np.asarray(img_small, dtype=np.float32)
-        if rgb.ndim != 3 or rgb.shape[2] < 3:
-            return 0.0
-        # HSV via cv2 (expects BGR)
-        bgr = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        sat = hsv[:, :, 1].astype(np.float32) / 255.0
-        val = hsv[:, :, 2].astype(np.float32) / 255.0
-
-        mean_val = float(val.mean())
-        mean_sat = float(sat.mean())
-        std_val = float(val.std())
-
-        # Three sub-scores in [0, 1].  Multiply for the final score so all
-        # three must agree before paper fires.
-        bright = max(0.0, (mean_val - 0.55) / 0.35)         # 0.55 -> 0,  0.90 -> 1
-        bright = min(bright, 1.0)
-        unsat = max(0.0, (0.30 - mean_sat) / 0.30)          # 0.30 -> 0, 0.00 -> 1
-        unsat = min(unsat, 1.0)
-        flat = max(0.0, (0.25 - std_val) / 0.25)            # noisy -> 0, very flat -> 1
-        flat = min(flat, 1.0)
-
-        return bright * unsat * flat
+        exif = img.getexif()
+        camera = bool(str(exif.get(_EXIF_MAKE, "")).strip())
+        raw = exif.get_ifd(_EXIF_IFD).get(_EXIF_USER_COMMENT, b"")
+        comment = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
     except Exception:
-        return 0.0
+        pass
+    xmp = img.info.get("xmp") or img.info.get("XML:com.adobe.xmp") or ""
+    if isinstance(xmp, bytes):
+        xmp = xmp.decode("utf-8", errors="ignore")
+    name = path.name.lower()
+    screenshot = (
+        "screenshot" in comment.lower()
+        or "<exif:UserComment>Screenshot" in xmp
+        or "screenshot" in name
+        or "screen shot" in name
+    )
+    w, h = img.size
+    tall = max(w, h) >= _TALL_RATIO * min(w, h)
+    return ImageMeta(screenshot=screenshot, camera=camera, tall=tall)
 
 
-# --- ImageNet model + class list (lazy, per-process) ------------------------
+# --- decoding ----------------------------------------------------------------
 
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-_INPUT_SIZE = 224
-
-_CLASS_NAMES: Optional[List[str]] = None
+_MAX_SIDE = 1024   # CLIP uses 224 px, YuNet 640 px; no need to keep more
 
 
-def _load_class_names() -> List[str]:
-    global _CLASS_NAMES
-    if _CLASS_NAMES is None:
-        path = models_dir() / "imagenet_classes.json"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Class-name file missing: {path}\n"
-                f"Run scripts/bootstrap_models.py to fetch it."
-            )
-        with path.open("r", encoding="utf-8") as f:
-            _CLASS_NAMES = [name.lower() for name in json.load(f)]
-    return _CLASS_NAMES
-
-
-def _model_path() -> Path:
-    return models_dir() / "mobilenetv3.onnx"
-
-
-# --- preprocessing -----------------------------------------------------------
-
-def _load_image(path: Path) -> Image.Image:
+def _load_image(path: Path) -> Tuple[Image.Image, ImageMeta]:
     img = Image.open(path)
+    # JPEG only: decode directly at reduced scale (much faster for 12 MP).
+    img.draft("RGB", (_MAX_SIDE, _MAX_SIDE))
+    meta = _read_meta(path, img)
     img = ImageOps.exif_transpose(img)
     if img.mode != "RGB":
         img = img.convert("RGB")
-    return img
-
-
-def _preprocess(img: Image.Image) -> np.ndarray:
-    w, h = img.size
-    short = min(w, h)
-    scale = _INPUT_SIZE / short
-    new_w, new_h = int(round(w * scale)), int(round(h * scale))
-    img = img.resize((new_w, new_h), Image.BILINEAR)
-    left = (new_w - _INPUT_SIZE) // 2
-    top = (new_h - _INPUT_SIZE) // 2
-    img = img.crop((left, top, left + _INPUT_SIZE, top + _INPUT_SIZE))
-
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    arr = (arr - _IMAGENET_MEAN) / _IMAGENET_STD
-    arr = np.transpose(arr, (2, 0, 1))                 # HWC -> CHW
-    arr = np.expand_dims(arr, 0).astype(np.float32)    # NCHW
-    return arr
-
-
-def _softmax(x: np.ndarray) -> np.ndarray:
-    x = x - x.max()
-    e = np.exp(x)
-    return e / e.sum()
+    img.thumbnail((_MAX_SIDE, _MAX_SIDE), Image.BILINEAR)
+    return img, meta
 
 
 # --- scoring -----------------------------------------------------------------
-
-def _content_type_scores(
-    probs: np.ndarray,
-    classes: List[str],
-    keywords: Dict[str, List[str]],
-) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
-    for ctype, kws in keywords.items():
-        if not kws:
-            scores[ctype] = 0.0
-            continue
-        total = 0.0
-        for i, name in enumerate(classes):
-            if any(kw in name for kw in kws):
-                total += float(probs[i])
-        scores[ctype] = total
-    return scores
-
 
 def _folder_scores(
     content_scores: Dict[str, float],
@@ -300,12 +234,19 @@ def _folder_scores(
     return out
 
 
+def _folder_of(ctype: str, folders: Dict[str, List[str]]) -> Optional[str]:
+    for folder, ctypes in folders.items():
+        if ctype in ctypes:
+            return folder
+    return None
+
+
 # --- result type -------------------------------------------------------------
 
 @dataclass
 class ImageResult:
     path: Path
-    folder: str               # e.g. 'personal', 'docs', 'unknown'
+    folder: str               # e.g. 'personal', 'screenshots', 'other'
     confidence: float         # 0..1+ (sum of contributing scores)
     tags: List[str] = field(default_factory=list)
     error: Optional[str] = None
@@ -317,74 +258,42 @@ def _classify_core(
     img: Image.Image,
     cfg: Config,
     *,
-    run_ocr: bool,
+    meta: Optional[ImageMeta],
     folders: Dict[str, List[str]],
 ) -> Tuple[str, float, Dict[str, float], List[str]]:
     """Return (best_folder, best_score, content_scores, tags)."""
     tags: List[str] = []
 
-    session = get_session(_model_path(), cfg.use_gpu)
-    x = _preprocess(img)
-    input_name = session.get_inputs()[0].name
-    out = session.run(None, {input_name: x})[0][0]
-    probs = _softmax(out)
-    classes = _load_class_names()
+    content_scores = clip.content_scores(img, cfg)
+    top = max(content_scores, key=content_scores.get)
+    tags.append(f"clip={top}({content_scores[top]:.2f})")
 
-    # Top class for the explanatory tag.
-    top_idx = int(np.argmax(probs))
-    tags.append(f"top={classes[top_idx]}({probs[top_idx]:.2f})")
+    shot = cfg.screenshot_content_type
+    if meta is not None and shot in content_scores:
+        if meta.camera:
+            tags.append("camera-exif")
+            content_scores[shot] = 0.0
+        elif meta.tall:
+            tags.append("tall-no-camera")
+            content_scores[shot] += cfg.screenshot_tall_boost
 
-    content_scores = _content_type_scores(probs, classes, cfg.keywords)
-
-    # Paper signal: OCR words OR blank-paper appearance heuristic.
-    paper_score = 0.0
-    ocr_words = 0
-    if run_ocr:
-        try:
-            ocr_words = ocr_module.count_words(img)
-        except Exception:
-            ocr_words = 0
-        if ocr_words > 0:
-            paper_score = max(paper_score, min(1.0, ocr_words / 30.0))
-            tags.append(f"ocr={ocr_words}")
-        else:
-            tags.append("ocr=0")
-
-    blank_score = _blank_paper_score(img)
-    if blank_score > 0.05:
-        tags.append(f"blank={blank_score:.2f}")
-    paper_score = max(paper_score, blank_score)
-
-    # If the user defined `keywords-paper`, let those classes also contribute
-    # to the paper signal.  E.g. envelope, menu, book_jacket all strongly
-    # suggest a document even when OCR misses the text.
-    keyword_paper_score = content_scores.get("paper", 0.0)
-    if keyword_paper_score > 0:
-        tags.append(f"paper-kw={keyword_paper_score:.2f}")
-    paper_score = max(paper_score, keyword_paper_score)
-
-    # Face detection.  YuNet is precise enough that we trust any face hit:
-    # if a real face is in the image, it's a personal photo, full stop —
-    # even if there's also a lot of OCR text (people in restaurants, group
-    # shots in front of signs, selfies with menus).  Paper signal is
-    # zeroed out when faces are present.
-    n_faces = 0
     if cfg.face_detection_enabled:
-        n_faces = _detect_faces(img)
+        n_faces = _detect_faces(img, cfg.face_min_score)
         if n_faces > 0:
             tags.append(f"faces={n_faces}")
             target = cfg.face_target_content_type
-            boost = cfg.face_boost
-            content_scores[target] = max(content_scores.get(target, 0.0), boost)
-            if paper_score > 0:
-                tags.append("paper-suppressed-by-face")
-                paper_score = 0.0
+            content_scores[target] = content_scores.get(target, 0.0) + cfg.face_boost
 
-    content_scores["paper"] = paper_score
+    if cfg.ocr_boost > 0:
+        words = ocr_module.count_words(img)
+        tags.append(f"ocr={words}")
+        target = cfg.ocr_content_type
+        content_scores[target] = (content_scores.get(target, 0.0)
+                                  + cfg.ocr_boost * min(1.0, words / 30.0))
 
     folder_scores = _folder_scores(content_scores, folders)
     if not folder_scores:
-        return "unknown", 0.0, content_scores, tags
+        return cfg.fallback_folder, 0.0, content_scores, tags
 
     best_folder, best_score = max(folder_scores.items(), key=lambda kv: kv[1])
     return best_folder, float(best_score), content_scores, tags
@@ -394,14 +303,20 @@ def _classify_core(
 
 def classify(path: Path, cfg: Config) -> ImageResult:
     try:
-        img = _load_image(path)
+        img, meta = _load_image(path)
     except Exception as e:
         return ImageResult(path=path, folder="unknown", confidence=0.0,
-                           tags=[f"decode_error"], error=f"decode: {e}")
+                           tags=["decode_error"], error=f"decode: {e}")
+
+    if cfg.screenshot_metadata and meta.screenshot:
+        folder = _folder_of(cfg.screenshot_content_type, cfg.image_folders)
+        if folder is not None:
+            return ImageResult(path=path, folder=folder, confidence=1.0,
+                               tags=["screenshot-meta"])
 
     try:
         best_folder, best_score, _scores, tags = _classify_core(
-            img, cfg, run_ocr=True, folders=cfg.image_folders,
+            img, cfg, meta=meta, folders=cfg.image_folders,
         )
     except Exception as e:
         return ImageResult(path=path, folder="unknown", confidence=0.0,
@@ -409,7 +324,7 @@ def classify(path: Path, cfg: Config) -> ImageResult:
 
     if best_score < cfg.unknown_threshold:
         return ImageResult(
-            path=path, folder="unknown", confidence=float(best_score),
+            path=path, folder=cfg.fallback_folder, confidence=float(best_score),
             tags=tags + ["below-threshold"],
         )
 
@@ -424,7 +339,7 @@ def classify_pil(
     img: Image.Image, cfg: Config
 ) -> Tuple[str, float, Dict[str, float], List[str]]:
     """Classify a single video frame.  Returns folder, score, content_scores, tags.
-    Skips OCR (rarely useful inside a video, expensive at 5x per file)."""
+    No file metadata and no OCR for frames."""
     if img.mode != "RGB":
         img = img.convert("RGB")
-    return _classify_core(img, cfg, run_ocr=False, folders=cfg.video_folders)
+    return _classify_core(img, cfg, meta=None, folders=cfg.video_folders)

@@ -47,32 +47,27 @@ python -m venv .venv
 `onnxruntime-gpu` is large (~1 GB). If you don't need CUDA, swap it for
 `onnxruntime` (CPU-only, ~150 MB) by editing `requirements.txt`.
 
-### 3. (Optional, build-time only) Install torch + torchvision
-
-Only needed if you want to **re-export** MobileNetV3 ONNX from scratch via
-`scripts/bootstrap_models.py`. The committed `models/mobilenetv3.onnx`
-is already exported — skip this step unless you specifically need to
-regenerate it.
+### 3. Download the models (one-time, online)
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-.\.venv\Scripts\python.exe -m pip install onnxscript
-$env:PYTHONIOENCODING = "utf-8"   # avoids cp1252 emoji crash from torch.onnx
 .\.venv\Scripts\python.exe scripts\bootstrap_models.py
 ```
 
-The committed `models/` folder (24 MB) contains:
+The CLIP files are too big for git (GitHub's limit is 100 MB per file),
+so `models/clip/` is git-ignored and this step is required. The script
+resumes broken downloads and skips files that are already complete.
 
 | File | Size | Source |
 |---|---|---|
-| `mobilenetv3.onnx` | 347 KB graph | torchvision `MobileNet_V3_Large_Weights.IMAGENET1K_V2` |
-| `mobilenetv3.onnx.data` | 22 MB weights | (external-data sidecar) |
-| `imagenet_classes.json` | 16 KB | torchvision `WEIGHTS.meta["categories"]` |
-| `silero_vad.onnx` | 2.3 MB | <https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx> |
-| `yunet_face.onnx` | 232 KB | <https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> |
+| `clip/vision_model.onnx` | 335 MB | <https://huggingface.co/Xenova/clip-vit-base-patch32> (`onnx/vision_model.onnx`) |
+| `clip/text_model.onnx` | 242 MB | same repo (`onnx/text_model.onnx`) |
+| `clip/tokenizer.json` | 2 MB | same repo |
+| `silero_vad.onnx` | 2.3 MB | <https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx> (committed) |
+| `yunet_face.onnx` | 232 KB | <https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> (committed) |
 
-### 4. Install bundled binaries (Tesseract)
+### 4. (Optional) Install bundled binaries (Tesseract)
 
+Only needed when `ocr-boost > 0` in the conf (off by default).
 Tesseract is excluded from the repo (239 MB total; one DLL is 97 MB).
 Install once and either copy the install dir into `third_party/tesseract/`
 or just leave it system-wide — the app finds it at
@@ -127,33 +122,55 @@ $env:PYTHONPATH = "src"
 powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
-Output: `dist\MediaOrganizer\` (~1.4 GB unzipped). Copy that folder
-anywhere — fully portable.
+Output: `dist\MediaOrganizer\` (~1.8 GB unzipped with Tesseract). Copy
+that folder anywhere — fully portable.
 
 ---
 
 ## Models
 
-### MobileNetV3-Large (image classifier)
+### CLIP ViT-B/32 (image classifier)
 
-- **Source**: torchvision `MobileNet_V3_Large_Weights.IMAGENET1K_V2`.
-- **Export**: `scripts/bootstrap_models.py` → ONNX opset 17, FP32, with
-  `dynamic_axes={"input": {0: "batch"}}`.
-- **Input**: NCHW, 3×224×224, normalized with ImageNet mean/std.
-- **Output**: 1000-logit vector. We softmax it ourselves.
-- **External data**: torch's exporter automatically writes an
-  `mobilenetv3.onnx.data` sidecar holding the 22 MB of weights. Both
-  files must travel together; ORT loads the data file by name.
-- **Class names**: from `weights.meta["categories"]`, frozen in
-  `models/imagenet_classes.json`. The order MUST match the model's
-  output ordering — never re-derive these from a different source.
+- **Source**: OpenAI CLIP ViT-B/32, ONNX export by Xenova
+  (<https://huggingface.co/Xenova/clip-vit-base-patch32>). License: MIT.
+- **Why CLIP**: zero-shot. Categories are plain-English sentences in the
+  conf (`prompts-<type>`), so "screenshot", "document", "object photo"
+  work although ImageNet has no such classes. On `test/holdout`:
+  CLIP 94.9 %, old MobileNetV3/ImageNet pipeline 30.6 %.
+- **Models compared** (zero-shot only, same prompts, `test/sample`):
+
+  | Model | center-crop | pad to square |
+  |---|---|---|
+  | CLIP ViT-B/32 | 83.8 % | **88.9 %** |
+  | CLIP ViT-B/16 | 81.5 % | 85.2 % |
+  | SigLIP base-16-224 | 80.1 % | 84.2 % |
+
+  Pad-to-square wins because tall screenshots lose their status bar and
+  app chrome in a center crop.
+- **Variants**: fp32 is used. The int8 `vision_model_quantized.onnx`
+  (84 MB) scored ~3 points lower in the full pipeline; the int8 text model
+  lowered it ~4 points; `vision_model_fp16.onnx` fails to load in ORT 1.23
+  (graph-optimizer bug: `InsertedPrecisionFreeCast_...`).
+- **Vision input**: `pixel_values` NCHW 1×3×224×224, CLIP mean/std,
+  bicubic resize after grey padding. Output `image_embeds` (512).
+- **Text input**: `input_ids` (int64, 1×n, no padding), from the HF
+  `tokenizers` library with `clip/tokenizer.json`. Output `text_embeds`.
+- **Scoring**: cosine similarity × 100 (CLIP's logit scale) → softmax
+  over all prompts → summed per content type.
+- **Text embeddings** are computed once in the main process
+  (`clip.compute_text_embeddings`) and passed to the workers through the
+  pool initializer, so the text model is loaded only once per run.
+- **Speed / RAM** (CPU, 1 thread): ~87 ms per image, +352 MB RSS per
+  session. 4 threads: ~30 ms.
 
 ### YuNet (face detector)
 
 - **Source**: <https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx>. License: MIT.
 - **API**: `cv2.FaceDetectorYN_create` (bundled in `opencv-python` ≥ 4.5.4).
 - **Input size**: arbitrary; we cap to 640px on the long edge for speed.
-- **Score threshold**: 0.7 (set in `image.py`).
+- **Score threshold**: `face-min-score` in the conf (default 0.88). On
+  `test/sample`, real faces scored 0.88–0.95; cartoon faces on cookies and
+  toys scored 0.5–0.87. A hit adds `face-boost` (0.5) to `person`.
 - **Why over Haar cascades**: Haar produces many false positives on
   documents, logos, and patterned objects. YuNet is a small DNN
   trained on actual face data and almost never fires on non-face
@@ -171,8 +188,12 @@ anywhere — fully portable.
   unsupported.
 - **Speech threshold**: 0.5; tweakable in `audio.py`.
 
-### Tesseract OCR
+### Tesseract OCR (optional)
 
+- **Status**: off by default (`ocr-boost = 0`). On `test/sample`, an OCR
+  document boost of 0.1–0.2 changed nothing and 0.3+ made results worse;
+  OCR was also the slowest step and caused false "documents" on textured
+  photos in the old pipeline.
 - **Mode**: `--psm 6` ("single uniform block of text") — faster than
   PSM 3 (auto-segment) and adequate for the binary "is this a document?"
   question.
@@ -181,7 +202,7 @@ anywhere — fully portable.
   `_MIN_CONF = 60` (in `ocr.py`) are dropped. This kills hallucinated
   pseudo-words on textured surfaces (concrete, fabric, tree bark).
   Tokens still must match the regex `[A-Za-zÀ-ɏ]{2,}`.
-- **Threshold to fire `paper`**: `min(1.0, words / 30.0)` per file.
+- **Boost**: `ocr-boost * min(1.0, words / 30.0)` added to `ocr-content-type`.
 - **Tessdata**: only `eng.traineddata` is needed for the count
   heuristic. Adding more languages is fine but slows startup.
 - **Bundle locations searched, in order**:
@@ -214,34 +235,53 @@ anywhere — fully portable.
 
 ## Image classification scoring
 
-For each image:
+For each image (`classifiers/image.py`):
 
-1. Run MobileNetV3 → softmax → 1000-class probabilities.
-2. For each `keywords-<type>` list in conf, sum probabilities of classes
-   whose names contain any keyword (substring, case-insensitive).
-3. **Paper signal**: `max(keyword_paper_score, ocr_words/30, blank_score)`.
-4. **Face boost**: if YuNet finds ≥1 face, set
-   `content_scores[face_target] = max(current, face_boost)` and zero out
-   `paper`. A real face beats text-in-background.
-5. **Folder scoring**: for each `image-<folder>` in conf, sum its
-   content-type scores.
-6. Best folder wins; if best score < `unknown-threshold` → `images/unknown/`.
+1. Decode at reduced size (`Image.draft` for JPEG, then max 1024 px) and
+   read metadata: camera `Make`, EXIF/XMP `UserComment`, file name,
+   aspect ratio.
+2. `UserComment` contains `Screenshot` (iOS) or the name contains
+   `screenshot` → screenshot folder immediately (`screenshot-meta` tag).
+3. CLIP → one probability per content type (sum = 1).
+4. Camera `Make` present → screenshot score = 0. No camera `Make` and
+   aspect ≥ 1.9 → `+ screenshot-tall-boost` (messenger re-sends strip EXIF
+   but keep the screen shape).
+5. YuNet face ≥ `face-min-score` → `+ face-boost` to `person`.
+6. Optional OCR boost.
+7. Folder score = sum of its content types; best wins; below
+   `unknown-threshold` → `fallback-folder`.
 
-The blank-paper heuristic (in `image.py::_blank_paper_score`) checks:
+Video frames use steps 3, 5, 6 (no metadata).
 
-- Mean luminance > 0.55 (bright)
-- Mean saturation < 0.30 (low color)
-- Std of value < 0.25 (smooth surface)
+### How the numbers were chosen
 
-All three must agree (multiplicative); thresholds picked to avoid firing
-on snow scenes, blue sky, overexposed selfies.
+`test/sample` (297 hand-labeled images from a real phone dump) was used
+for every choice above; `test/holdout` (98 other images) was only used
+for the final check. Simulation on `test/sample`:
+
+| Pipeline | Accuracy |
+|---|---|
+| CLIP only | 91.2 % |
+| + face boost 0.5 at score ≥ 0.88 | 93.6 % |
+| + screenshot metadata / camera EXIF / tall boost | 94.6 % |
+| + `unknown-threshold` 0.40 → other | 96.3 % |
+
+Face score thresholds 0.85–0.90 gave the same result; boost 0.3 or 1.0
+were worse than 0.5.
 
 ---
 
 ## Multiprocessing on Windows
 
 - We use `concurrent.futures.ProcessPoolExecutor` with an `initializer`
-  that stashes the parsed `Config` in a module global of each worker.
+  that stashes the parsed `Config` (plus the CLIP text embeddings and the
+  ONNX thread count) in module globals of each worker.
+- **Worker count**: `cpu-workers = auto` means
+  `min(cpu_count, free_RAM / 700 MB)` (`workers._auto_workers`), because
+  each worker holds its own CLIP session (~350 MB). Each worker then gets
+  `cpu_count // workers` ONNX intra-op threads, so all cores stay busy.
+- **GPU note**: with CUDA, every worker creates its own CUDA session of
+  CLIP. On an 8 GB card, set `cpu-workers` to a small number (e.g. 4).
 - **Spawn**, not fork: Windows has no fork. The entry point must be
   guarded by `if __name__ == "__main__":` and call
   `multiprocessing.freeze_support()` for PyInstaller compatibility — we
@@ -351,32 +391,34 @@ Approximate sizes:
 | Artifact | Size |
 |---|---|
 | `media-organizer.exe` | 33 MB |
-| `_internal/` | 1.1 GB (mostly onnxruntime CUDA + torch_cpu DLLs) |
-| `models/` | 24 MB |
-| `third_party/tesseract/` | 239 MB |
-| **Total** | ~1.4 GB |
+| `_internal/` | 1.1 GB (mostly onnxruntime CUDA DLLs) |
+| `models/` | ~600 MB (CLIP 580 MB) |
+| `third_party/tesseract/` | 239 MB (optional) |
+| **Total** | ~1.8 GB |
 
 To shrink to ~150 MB, swap `onnxruntime-gpu` → `onnxruntime` in
 `requirements.txt` (loses GPU support).
 
 ---
 
-## Performance ballparks (CPU-only, 8-core laptop)
+## Performance ballparks (CPU-only)
 
-- Image classify (full pipeline): ~150–400 ms per file.
-- Video classify (5 frames, 1080p): ~1–3 s.
+Measured on a 20-thread laptop with ~2 GB free RAM (so `auto` = 2
+workers × 10 threads):
+
+- Image classify (decode + CLIP + YuNet): ~350 ms wall per image
+  (old MobileNet + OCR pipeline: ~560 ms with 8 workers).
+- Screenshots with metadata skip the model: decode time only.
+- Video classify (5 frames): ~1–2 s.
 - Audio classify (3 min MP3): ~1–2 s.
-- Throughput at 8-way parallelism: ~25 images/s, 4 videos/s, 6 audios/s.
-- 564-file phone DCIM (~14 GB): ~90 minutes end-to-end on CPU.
 
-GPU adds ~3–5× to the image path; OCR + ffmpeg + librosa stay on CPU.
+More free RAM → more workers → faster.
 
 ---
 
 ## Useful URLs
 
-- ImageNet 1000-class names (must match torchvision order!):
-  `MobileNet_V3_Large_Weights.IMAGENET1K_V2.meta["categories"]`
+- CLIP ONNX models: <https://huggingface.co/Xenova/clip-vit-base-patch32>
 - silero-vad: <https://github.com/snakers4/silero-vad>
 - YuNet: <https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet>
 - Tesseract Windows builds: <https://github.com/UB-Mannheim/tesseract/wiki>
@@ -391,8 +433,10 @@ GPU adds ~3–5× to the image path; OCR + ffmpeg + librosa stay on CPU.
 
 ## Future ideas (NOT implemented; just notes)
 
-- Replace the OCR-everywhere strategy with a tiny "text-vs-photo"
-  classifier to skip Tesseract on most images (3–5× speed-up).
+- Batch CLIP inference (several images per `session.run`) for better
+  CPU/GPU use.
+- A small linear head trained on CLIP embeddings of labeled images
+  (few-shot) if prompt tuning stops improving `test/holdout`.
 - Music genre via `MusicGenreClassifier` ONNX (50 MB, GTZAN-trained)
   for an optional `audio/music/<genre>/` second axis.
 - Per-folder confidence overrides in the conf so e.g.

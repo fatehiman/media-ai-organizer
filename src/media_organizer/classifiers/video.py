@@ -225,13 +225,13 @@ def classify(path: Path, cfg: Config) -> VideoResult:
 
     if best_score < cfg.unknown_threshold:
         return VideoResult(
-            path=path, folder="unknown", confidence=float(best_score),
+            path=path, folder=cfg.fallback_folder, confidence=float(best_score),
             tags=tags + ["below-threshold"],
         )
 
     if best_folder not in cfg.video_folders:
         return VideoResult(
-            path=path, folder="unknown", confidence=float(best_score),
+            path=path, folder=cfg.fallback_folder, confidence=float(best_score),
             tags=tags + [f"not-a-video-folder:{best_folder}"],
         )
 

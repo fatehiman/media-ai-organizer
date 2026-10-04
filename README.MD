@@ -8,15 +8,18 @@ CUDA GPU is present, falls back to CPU automatically.
 ```
 target/
 ├── images/
-│   ├── personal/      photos of people, nature, animals, buildings, museums
-│   ├── docs/          papers, receipts, screenshots, menus, envelopes
-│   ├── painting/      framed paintings, artwork
-│   ├── nonsense/      object-only shots that aren't memories or documents
-│   └── unknown/       anything below the confidence threshold
+│   ├── personal/      photos with people (a real human face)
+│   ├── documents/     paper and writing: forms, receipts, ID cards, books
+│   ├── objects/       things: products, food, toys, crafts, clothes
+│   ├── screenshots/   phone / computer screenshots
+│   └── other/         landscapes, streets, animals, rooms, clipart, and
+│                      anything below the confidence threshold
 ├── video/
 │   ├── personal/      same buckets, voted across sampled frames
-│   ├── nonsense/
-│   └── unknown/
+│   ├── documents/
+│   ├── objects/
+│   ├── screenshots/   screen recordings
+│   └── other/
 ├── audio/
 │   ├── talk/          phone calls, meetings, voice notes (speech-dominant)
 │   ├── music/
@@ -30,30 +33,38 @@ target/
 
 ## Highlights
 
-- **Offline**. All inference runs locally with ONNX Runtime + bundled
-  Tesseract. No network calls at runtime.
+- **Offline**. All inference runs locally with ONNX Runtime. No network
+  calls at runtime.
+- **CLIP zero-shot**. Each category is described by short English
+  sentences in the config (`prompts-<type>`). CLIP ViT-B/32 compares the
+  image with every sentence, so categories can be tuned without training.
+  On a hand-labeled hold-out set of real phone media: **94.9 %** correct
+  (the previous MobileNet/ImageNet version: 30.6 %). See `test/`.
+- **Screenshot metadata**. iOS writes `Screenshot` into the EXIF of every
+  screenshot; Android names them `Screenshot_*`. Such files skip the model.
+  A photo with camera EXIF (`Make`) is never called a screenshot.
 - **GPU + CPU saturation**. ONNX Runtime uses CUDA when `cudnn64_9.dll` and
   `cublasLt64_12.dll` are findable; otherwise transparent CPU fallback.
-  Classification work is fanned out across `os.cpu_count()` worker
-  processes either way.
+  Classification work is fanned out across worker processes; with
+  `cpu-workers = auto` their number is capped by free RAM (~700 MB each).
 - **Dry-run by default**. The first pass writes a full plan with explanatory
   tags to a move log file and prompts for confirmation before any file is
   moved.
 - **Crash-safe resume**. Every successful move is fsync'd to the log; if the
   process is killed mid-run, the next invocation picks up where it left off.
-- **YuNet face detection** (DNN, 232 KB). ImageNet has no "person" class —
-  YuNet finds people in photos that ImageNet would otherwise mis-tag based
-  on clothing or accessories. Far fewer false positives than Haar cascades.
-- **Confidence-filtered OCR**. Tesseract's per-word confidence is checked;
-  hallucinated "words" on textured surfaces (concrete, fabric, foliage)
-  don't count toward the document signal.
+- **YuNet face detection** (DNN, 232 KB). A face with score ≥ 0.88 boosts
+  `personal`. Real faces score ~0.90+; cartoon faces on toys and cookies
+  mostly score lower, so they don't count.
+- **Optional OCR**. Tesseract can add a document boost (`ocr-boost`); it is
+  off by default because CLIP already recognizes documents and OCR is the
+  slowest step.
 - **Sidecars travel with their parent**. `.json`, `.xmp`, `.aae`, `.thm`,
   `.srt`, `.nfo`, `.txt`, `.vtt` are moved alongside their primary file so
   Google Takeout metadata, subtitles, and edit-list markers stay paired.
 - **No renames**. Original filenames are preserved; collisions get a numeric
   suffix (`IMG_0001.jpg` → `IMG_0001 (2).jpg`).
 - **Dynamic config**. Add or remove `image-<folder>` / `video-<folder>` /
-  `keywords-<type>` lines in `media-organizer.conf` without touching code.
+  `prompts-<type>` lines in `media-organizer.conf` without touching code.
 
 ## Quick start
 
@@ -65,7 +76,7 @@ For developers building from source, see
 
 ### Run the portable .exe
 
-1. Download or build `MediaOrganizer/` (a portable folder, ~1.4 GB).
+1. Download or build `MediaOrganizer/` (a portable folder, ~1.8 GB).
 2. Edit `MediaOrganizer\media-organizer.conf`:
    ```
    source = D:\Photos\Unsorted
@@ -105,62 +116,63 @@ The most important keys:
 |-----------------------------------|-------------------------------------------------------------------------|
 | `source` / `target`               | Required. Absolute paths.                                               |
 | `dry-run`                         | If `true`, plan only.                                                   |
-| `unknown-threshold`               | Minimum classifier confidence (0–1). Below this, → `unknown/`.          |
+| `unknown-threshold`               | Minimum classifier confidence (0–1). Below this, → `fallback-folder`.   |
+| `fallback-folder`                 | Folder for low-confidence images/videos (default `other`).              |
 | `collision-suffix`                | Format for the numeric suffix. Default `({n})` → ` (2)`, ` (3)`, …      |
 | `move-sidecars` / `sidecar-extensions` | Whether and which sidecar files to move with their parent.         |
 | `use-gpu`                         | `auto` / `yes` / `no`.                                                  |
-| `cpu-workers`                     | `auto` (= all cores) or an integer.                                     |
+| `cpu-workers`                     | `auto` (= cores, capped by free RAM) or an integer.                     |
 | `ext-image` / `ext-video` / `ext-audio` | Which extensions count as each kind.                              |
 | `image-<folder>`                  | Comma-separated list of content types that map into `images/<folder>/`. |
 | `video-<folder>`                  | Same for video.                                                         |
 | `rhythm-<band>`                   | `lo-hi` BPM range; defines `audio/music/<band>/`.                       |
-| `keywords-<type>`                 | ImageNet class-name substrings that count toward this content type.     |
-| `keywords-paper`                  | Document-class names (envelope, menu, book_jacket, …).                  |
+| `prompts-<type>`                  | CLIP sentences that describe this content type.                         |
 | `face-detection`                  | `true` / `false`. Enables YuNet face-detection boost.                   |
-| `face-boost`                      | Score (0–1) added to `face-target-content-type` when a face is found.   |
-| `face-target-content-type`        | Content type that face hits feed into (default `human`).                |
+| `face-min-score`                  | YuNet score (0–1) a face needs to count (default 0.88).                 |
+| `face-boost`                      | Score added to `face-target-content-type` when a face is found.         |
+| `face-target-content-type`        | Content type that face hits feed into (default `person`).               |
+| `screenshot-metadata`             | Use EXIF / file name to find screenshots and camera photos.             |
+| `screenshot-tall-boost`           | Added to `screenshot` for phone-shaped images without camera EXIF.      |
+| `ocr-boost` / `ocr-content-type`  | Optional Tesseract boost (0 = off).                                     |
 | `audio-talk-min-speech-ratio`     | Threshold for routing into `audio/talk/`.                               |
 | `audio-music-max-speech-ratio`    | Threshold for routing into `audio/music/`.                              |
 
 You can add new image folders simply by adding a line — the app picks them up:
 
 ```
-image-art = paintings, drawings, sculptures
-keywords-paintings  = oil_painting
-keywords-drawings   = sketch, comic_book
-keywords-sculptures = statue
+image-art = painting, drawing
+prompts-painting = a painting, a photo of a painting in a frame
+prompts-drawing  = a pencil drawing, a sketch
 ```
+
+A new type takes probability from the others, so check the result with
+`test/eval.py` (see [Testing](#testing)).
 
 ## How classification works
 
 ### Images
 
-For each file the pipeline runs in parallel:
+For each file:
 
-1. **MobileNetV3-Large** (ImageNet, 1000 classes) → softmax probabilities.
-2. **YuNet** face detector → number of faces.
-3. **Tesseract OCR** → list of words with per-word confidence.
-4. **Blank-paper heuristic** → light/unsaturated/flat-surface score.
-
-Then it aggregates:
-
-- For each `keywords-<type>` list (e.g. `keywords-human`, `keywords-paper`),
-  sum the ImageNet probabilities of classes whose names contain any
-  configured keyword (substring, case-insensitive).
-- `paper` content type combines: keyword score + (high-confidence-OCR
-  word count / 30) + blank-paper heuristic. Highest wins.
-- If a face is detected, `face-target-content-type` (default `human`) is
-  forced to at least `face-boost` (default 0.95). The paper signal is
-  zeroed out — a real face beats whatever text is in the background.
-- For each `image-<folder>` (e.g. `image-personal = human, nature, …`),
-  sum the scores of its content types.
-- Best folder wins; if the best score is below `unknown-threshold`, the
-  file goes to `images/unknown/`.
+1. **Screenshot metadata**: EXIF `UserComment = Screenshot` (iOS) or
+   `screenshot` in the file name (Android) → `screenshots`, done.
+2. **CLIP ViT-B/32** compares the image (padded to a square, 224 px) with
+   every `prompts-<type>` sentence. A type's score is the summed softmax
+   probability of its sentences; all types together sum to 1.
+3. **Camera EXIF** (`Make`) present → `screenshot` score set to 0.
+   **No camera EXIF and phone-shaped** (≥ 1.9 : 1, e.g. a screenshot
+   re-sent by a messenger) → `screenshot-tall-boost` added.
+4. **YuNet** finds a face with score ≥ `face-min-score` → `face-boost`
+   added to `person`.
+5. (Optional) **OCR** word count adds up to `ocr-boost` to `document`.
+6. For each `image-<folder>`, sum the scores of its content types. Best
+   folder wins; below `unknown-threshold` → `fallback-folder` (`other`).
 
 ### Videos
 
 `OpenCV` (cv2) extracts 5 frames evenly distributed through the video.
-Each frame goes through the image pipeline (no OCR — too slow at 5×).
+Each frame goes through the image pipeline (CLIP + faces; no file
+metadata and no OCR).
 The folder with the highest single-frame score wins. Ties broken by total
 score across all frames. Falls back to bundled `ffmpeg` if cv2 can't
 open the container.
@@ -200,14 +212,36 @@ The **TAGS** column is a `|`-separated list of explanatory reasons:
 
 | Tag | Meaning |
 |---|---|
-| `top=swing(0.14)` | Top ImageNet class and its probability |
-| `ocr=42` | High-confidence OCR words found |
-| `blank=0.81` | Blank-paper heuristic score |
-| `paper-kw=0.45` | ImageNet class score for `keywords-paper` |
-| `faces=5` | Face detector found 5 faces |
-| `paper-suppressed-by-face` | Face hit zeroed the paper signal |
+| `screenshot-meta` | EXIF / file name says screenshot (no model ran) |
+| `clip=object(0.83)` | Top CLIP content type and its probability |
+| `camera-exif` | Camera `Make` found; screenshot score zeroed |
+| `tall-no-camera` | Phone-shaped without camera EXIF; screenshot boosted |
+| `faces=5` | 5 faces with score ≥ `face-min-score` |
+| `ocr=42` | OCR words found (only when `ocr-boost` > 0) |
 | `f0=personal(1.05)|f1=…` | Per-frame video votes |
 | `below-threshold` | Best score < `unknown-threshold` |
+
+## Testing
+
+`test/` holds a labeled test set taken from real phone media:
+
+- `make_sample.py <media-root> <n> [name] [seed]` picks random images and
+  draws numbered contact sheets (`test/sheets/<name>/`) for labeling.
+- `<name>_labels.txt` has one `<id> <letter>` line per image
+  (`P` personal, `D` documents, `O` objects, `S` screenshots, `X` other;
+  `A/B` = both are fine).
+- `eval.py --set sample|holdout --show-wrong` runs the real classifier
+  and prints accuracy, a confusion matrix and every mistake.
+
+`sample` (297 images) was used to choose the model, prompts and
+thresholds; `holdout` (98 images) was not. Current results:
+
+| Set | Old (MobileNet) | New (CLIP) |
+|---|---|---|
+| sample | 31.6 % | 96.3 % |
+| holdout | 30.6 % | 94.9 % |
+
+Re-run `eval.py --set holdout` after changing prompts or thresholds.
 
 ## Limitations / known caveats
 
@@ -217,7 +251,9 @@ The **TAGS** column is a `|`-separated list of explanatory reasons:
   `unknown/`.
 - The first run pays a ~5 s ONNX Runtime + librosa import startup. Files
   in the same run after that are fast.
-- ImageNet has no clean "document" class, which is why we use OCR + the
-  blank-paper heuristic + `keywords-paper`. False positives can still
-  appear (a screenshot of a face will go to `personal`, not `docs`).
-- `keywords-nonsense` is fuzzy by design; tune to taste.
+- People with a hidden or covered face (masks, hand over face, back of
+  the head) may go to `other` when CLIP is unsure and no face is found.
+- Downloaded clipart and logos sometimes land in `objects` instead of
+  `other`.
+- "Objects" vs "other" is a fuzzy line (flowers, furniture, rooms); tune
+  the `prompts-object` / `prompts-scenery` lines to taste.

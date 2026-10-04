@@ -5,9 +5,12 @@ We use multiprocessing because:
   * The image / audio / video classifiers are mostly CPU-bound numpy + ONNX
     work, plus subprocess calls (ffmpeg, tesseract).  GIL contention would
     cap thread-based parallelism.
-  * Each worker creates its own ONNX session lazily on first use.  Multiple
-    sessions sharing one GPU works fine for small models (MobileNetV3 ~22MB,
-    silero-vad ~2MB).
+  * Each worker creates its own ONNX session lazily on first use.  The CLIP
+    vision model costs ~350 MB of RAM per worker, so with `cpu-workers =
+    auto` the pool size is capped by free RAM (see `_auto_workers`) and
+    each worker gets several ONNX threads to keep all cores busy.
+  * The CLIP text embeddings are computed once here, in the main process,
+    and handed to every worker.
 
 The dispatcher routes by media kind so each call lands in the right
 classifier.  Failures are caught and surfaced as classification results
@@ -16,14 +19,18 @@ with `error` populated (the file then routes to `unknown/`).
 
 from __future__ import annotations
 
+import ctypes
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
+import numpy as np
 from tqdm import tqdm
 
+from . import runtime
 from .config import Config
 from .scanner import MediaItem
 
@@ -44,9 +51,56 @@ class Classification:
 _WORKER_CFG: Optional[Config] = None
 
 
-def _init_worker(cfg: Config) -> None:
+def _init_worker(
+    cfg: Config,
+    text_embeddings: Optional[Tuple[List[str], np.ndarray]],
+    onnx_threads: int,
+) -> None:
     global _WORKER_CFG
     _WORKER_CFG = cfg
+    runtime.set_intra_op_threads(onnx_threads)
+    if text_embeddings is not None:
+        from .classifiers import clip
+        clip.set_text_embeddings(text_embeddings)
+
+
+# RAM one worker needs: CLIP vision session (~350 MB) + decoded image and
+# YuNet / OCR buffers.  Measured peak is ~550 MB; keep some margin.
+_WORKER_RAM_BYTES = 700 * 1024 * 1024
+
+
+def _available_ram() -> Optional[int]:
+    """Free physical RAM in bytes, or None if it can't be read."""
+    try:
+        if sys.platform == "win32":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+            return None
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _auto_workers() -> int:
+    cpus = os.cpu_count() or 4
+    ram = _available_ram()
+    if ram is None:
+        return cpus
+    return max(1, min(cpus, ram // _WORKER_RAM_BYTES))
 
 
 def _classify_one(item: MediaItem) -> Classification:
@@ -82,7 +136,9 @@ def classify_all(
     """Run all classification tasks in parallel; return one Classification
     per input MediaItem (preserving input order)."""
 
-    workers = cfg.cpu_workers if cfg.cpu_workers > 0 else (os.cpu_count() or 4)
+    workers = cfg.cpu_workers if cfg.cpu_workers > 0 else _auto_workers()
+    # Spread the cores over the workers (1 thread each when not RAM-capped).
+    onnx_threads = max(1, (os.cpu_count() or 4) // workers)
 
     # Items with kind=='unknown' don't need a worker at all -- classify them
     # synchronously to avoid IPC overhead for thousands of trivial calls.
@@ -97,10 +153,16 @@ def classify_all(
     results_by_path = {c.item.path: c for c in quick}
 
     if todo:
+        text_embeddings = None
+        if any(it.kind in ("image", "video") for it in todo):
+            from .classifiers import clip
+            text_embeddings = clip.compute_text_embeddings(cfg)
+        if show_progress:
+            print(f"Workers       : {workers} x {onnx_threads} ONNX thread(s)")
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_worker,
-            initargs=(cfg,),
+            initargs=(cfg, text_embeddings, onnx_threads),
         ) as pool:
             futures = {pool.submit(_classify_one, it): it for it in todo}
             iterator: Iterable = as_completed(futures)

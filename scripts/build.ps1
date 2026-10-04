@@ -5,7 +5,7 @@
 #       media-organizer.exe          (entry point)
 #       _internal\                   (PyInstaller deps)
 #       media-organizer.conf         (default config)
-#       models\                      (ONNX + class names)
+#       models\                      (ONNX models, incl. models\clip\)
 #       third_party\
 #           tesseract\               (you provide the binary + tessdata)
 #           ffmpeg\                  (you provide the binaries)
@@ -15,7 +15,8 @@
 #       1. Activate your venv:        .\.venv\Scripts\Activate.ps1
 #       2. pip install -r requirements.txt
 #       3. python scripts\bootstrap_models.py            (one-time, online)
-#       4. Copy portable Tesseract  -> third_party\tesseract\tesseract.exe
+#       4. (Optional, only needed for ocr-boost > 0)
+#          Copy portable Tesseract  -> third_party\tesseract\tesseract.exe
 #                              + tessdata\eng.traineddata
 #       5. Copy portable ffmpeg     -> third_party\ffmpeg\bin\ffmpeg.exe
 #                                                          ffprobe.exe
@@ -31,12 +32,14 @@ Write-Host "Repo root: $repoRoot"
 # ---- preflight ---------------------------------------------------------------
 
 $required = @(
-    "models\mobilenetv3.onnx",
-    "models\imagenet_classes.json",
+    "models\clip\vision_model.onnx",
+    "models\clip\text_model.onnx",
+    "models\clip\tokenizer.json",
     "models\silero_vad.onnx",
-    "third_party\tesseract\tesseract.exe"
+    "models\yunet_face.onnx"
 )
 $optional = @(
+    "third_party\tesseract\tesseract.exe",
     "third_party\ffmpeg\bin\ffmpeg.exe",
     "third_party\ffmpeg\bin\ffprobe.exe"
 )
@@ -54,7 +57,7 @@ if ($missing.Count -gt 0) {
 }
 foreach ($o in $optional) {
     if (-not (Test-Path (Join-Path $repoRoot $o))) {
-        Write-Host "Optional asset missing: $o (cv2 will be used for video; that's fine)" -ForegroundColor Yellow
+        Write-Host "Optional asset missing: $o (only needed for ocr-boost > 0 / exotic video codecs)" -ForegroundColor Yellow
     }
 }
 
@@ -94,6 +97,7 @@ Write-Host "`nRunning PyInstaller from venv..." -ForegroundColor Cyan
     --hidden-import onnxruntime.capi._pybind_state `
     --hidden-import pytesseract `
     --hidden-import pillow_heif `
+    --hidden-import tokenizers `
     --hidden-import cv2 `
     $entry
 

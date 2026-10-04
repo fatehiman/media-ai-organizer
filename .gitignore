@@ -1,7 +1,7 @@
 # =============================================================================
 #  Media Organizer  —  .gitignore
 # -----------------------------------------------------------------------------
-#  Strategy: keep source, scripts, models (24 MB total), conf, README,
+#  Strategy: keep source, scripts, small models (~3 MB), conf, README,
 #  tech-ref.md.  Exclude anything that pushes us over GitHub's 100 MB
 #  per-file limit, anything reproducible from a `pip install`, and any
 #  user-data artifacts (move logs).  Setup instructions for the excluded
@@ -25,6 +25,14 @@ dist/
 *.spec
 warn-*.txt
 xref-*.html
+
+# --- CLIP model (~600 MB; files exceed GitHub's 100 MB limit) --------------
+# Fetch with:  python scripts/bootstrap_models.py
+models/clip/
+
+# --- Test outputs (contact sheets + eval results; regenerate any time) -----
+test/sheets/
+test/*_last_eval.csv
 
 # --- Bundled binaries (large; install per tech-ref.md) ---------------------
 # Tesseract is ~239 MB and one DLL is 97 MB.  Install via winget or copy

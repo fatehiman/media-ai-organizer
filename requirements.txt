@@ -5,6 +5,9 @@
 # when no CUDA device / DLL is available.
 onnxruntime-gpu>=1.17,<2.0
 
+# CLIP prompt tokenizer (reads models/clip/tokenizer.json)
+tokenizers>=0.15
+
 # Image decoding & preprocessing
 pillow>=10.2
 pillow-heif>=0.16          # HEIC/HEIF support

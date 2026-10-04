@@ -2,7 +2,7 @@
 Configuration loader for media-organizer.conf.
 
 The file is plain `key = value` (one per line, '#' or ';' starts a comment).
-Lists are CSV.  Prefix-keyed groups (e.g. `image-personal`, `keywords-human`,
+Lists are CSV.  Prefix-keyed groups (e.g. `image-personal`, `prompts-person`,
 `rhythm-slow`) are exposed as dicts so the CLI can iterate them dynamically.
 """
 
@@ -48,6 +48,7 @@ class Config:
     require_confirmation: bool = True
     move_log: str = "media-organizer-move.log"
     unknown_threshold: float = 0.40
+    fallback_folder: str = "other"      # images/videos below unknown-threshold
     collision_suffix: str = "({n})"
     move_sidecars: bool = True
     sidecar_extensions: List[str] = field(default_factory=list)
@@ -72,14 +73,24 @@ class Config:
 
     # Face detection
     face_detection_enabled: bool = True
-    face_boost: float = 0.95
-    face_target_content_type: str = "human"
+    face_min_score: float = 0.88
+    face_boost: float = 0.50
+    face_target_content_type: str = "person"
+
+    # Screenshot detection from file metadata
+    screenshot_content_type: str = "screenshot"
+    screenshot_metadata: bool = True
+    screenshot_tall_boost: float = 0.50
+
+    # Optional Tesseract OCR boost (0 = OCR not run at all)
+    ocr_boost: float = 0.0
+    ocr_content_type: str = "document"
 
     # Rhythm bands: {band_name: (lo_bpm, hi_bpm)}
     rhythm_bands: Dict[str, Tuple[int, int]] = field(default_factory=dict)
 
-    # Content-type keywords: {content_type: [substring, ...]}
-    keywords: Dict[str, List[str]] = field(default_factory=dict)
+    # CLIP prompts: {content_type: [sentence, ...]}
+    prompts: Dict[str, List[str]] = field(default_factory=dict)
 
     # Raw key/value bag for any keys we did not recognize (forward-compat).
     raw: Dict[str, str] = field(default_factory=dict)
@@ -140,6 +151,8 @@ def load(config_path: Path | str) -> Config:
         cfg.move_log = v
     if (v := get("unknown-threshold")) is not None:
         cfg.unknown_threshold = float(v)
+    if (v := get("fallback-folder")) is not None:
+        cfg.fallback_folder = v.strip()
     if (v := get("collision-suffix")) is not None:
         cfg.collision_suffix = v
     if (v := get("move-sidecars")) is not None:
@@ -169,10 +182,24 @@ def load(config_path: Path | str) -> Config:
     # -- Face detection ---------------------------------------------------
     if (v := get("face-detection")) is not None:
         cfg.face_detection_enabled = _parse_bool(v)
+    if (v := get("face-min-score")) is not None:
+        cfg.face_min_score = float(v)
     if (v := get("face-boost")) is not None:
         cfg.face_boost = float(v)
     if (v := get("face-target-content-type")) is not None:
         cfg.face_target_content_type = v.strip().lower()
+
+    # -- Screenshot / OCR signals ------------------------------------------
+    if (v := get("screenshot-content-type")) is not None:
+        cfg.screenshot_content_type = v.strip().lower()
+    if (v := get("screenshot-metadata")) is not None:
+        cfg.screenshot_metadata = _parse_bool(v)
+    if (v := get("screenshot-tall-boost")) is not None:
+        cfg.screenshot_tall_boost = float(v)
+    if (v := get("ocr-boost")) is not None:
+        cfg.ocr_boost = float(v)
+    if (v := get("ocr-content-type")) is not None:
+        cfg.ocr_content_type = v.strip().lower()
 
     # -- Prefix-keyed groups ----------------------------------------------
     for key, value in raw.items():
@@ -187,11 +214,9 @@ def load(config_path: Path | str) -> Config:
         elif key.startswith("rhythm-"):
             band = key[len("rhythm-"):]
             cfg.rhythm_bands[band] = _parse_bpm_range(value)
-        elif key.startswith("keywords-"):
-            ctype = key[len("keywords-"):]
-            cfg.keywords[ctype] = [
-                k.lower().strip() for k in _parse_csv(value)
-            ]
+        elif key.startswith("prompts-"):
+            ctype = key[len("prompts-"):]
+            cfg.prompts[ctype] = _parse_csv(value)
 
     cfg.raw = raw
     return cfg

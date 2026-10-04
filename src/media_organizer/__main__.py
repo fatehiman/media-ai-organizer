@@ -20,7 +20,7 @@ from . import __version__
 from . import config as config_module
 from . import pipeline
 from .movelog import MoveLogWriter, read_with_confirms
-from .runtime import active_provider, app_root, get_session, models_dir
+from .runtime import active_provider, app_root, get_session
 
 
 # --- helpers -----------------------------------------------------------------
@@ -53,9 +53,9 @@ def _confirm(prompt: str, default: bool = False) -> bool:
 
 def _check_provider() -> None:
     """Print which ONNX execution provider is active for the image model."""
-    from .classifiers import image as image_clf  # noqa: F401  (import side-effects)
+    from .classifiers import clip
     try:
-        sess = get_session(models_dir() / "mobilenetv3.onnx", "auto")
+        sess = get_session(clip.vision_model_path(), "auto")
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(2)

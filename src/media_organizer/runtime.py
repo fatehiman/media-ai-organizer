@@ -32,6 +32,13 @@ _DEFAULT_OPTS.inter_op_num_threads = 1
 _DEFAULT_OPTS.log_severity_level = 3
 
 
+def set_intra_op_threads(n: int) -> None:
+    """Threads per ONNX session in this process.  Workers call this when
+    RAM limits the pool to fewer processes than CPU cores, so the cores
+    are still used.  Must run before the first session is created."""
+    _DEFAULT_OPTS.intra_op_num_threads = max(1, n)
+
+
 def app_root() -> Path:
     """Return the folder that contains the app's bundled resources.
 
