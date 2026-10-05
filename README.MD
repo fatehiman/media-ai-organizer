@@ -109,33 +109,50 @@ Double-click `media-organizer-gui.exe`. The window opens in the center
 of the screen.
 
 ```
-┌ Source ─────────────────┐ ┌ Options ─────────────┐ ┌ Target ───────────────┐
-│ folder [Browse]         │ │ Resize: keep / % /   │ │ folder [Browse]       │
-│ 1,234 images, 2.1 GB    │ │   width / height     │ │ 2023\holidays\a.jpg   │
-│ [Files] [Folders]       │ │ Format: JPG / PNG    │ │ 2023\other\b.jpg      │
-│ [x] t_src          1  6 │ │   JPG quality 1-100  │ │ ...                   │
-│   [x] 2023         0  3 │ │ [ ] Move (del source)│ │ [Refresh]             │
-│     [x] holidays   2  2 │ │ [ ] Auto categorize  │ │                       │
-│     [ ] new-year   1  1 │ │     [x] personal ... │ │                       │
-│   [ ] 2024         1  1 │ │ [Preview] [Convert]  │ │                       │
-└─────────────────────────┘ └──────────────────────┘ └───────────────────────┘
+┌ Source ──────────────────────────┐ ┌ Options ─────────────┐ ┌ Target ──────────────┐
+│ folder [Browse]                  │ │ Resize: keep / % /   │ │ folder [Browse]      │
+│ Total: 6 images, 19.5 MB |       │ │   width / height     │ │ 2023\holidays\a.jpg  │
+│   Ticked: 3 images, 15.7 MB      │ │ Format: JPG / PNG    │ │ 2023\other\b.jpg     │
+│ [Folders] [Files]                │ │   JPG quality 1-100  │ │ ...                  │
+│ [Scan folders][Check all][Uncheck]│ │ [ ] Move (del source)│ │ [Refresh]            │
+│ [ ] t_src            6  19.5 MB  │ │ [ ] Auto categorize  │ │                      │
+│   [x] 2023           3  14.2 MB  │ │     [x] personal ... │ │                      │
+│     [x] holidays     2  13.8 MB  │ │ [Preview] [Convert]  │ │                      │
+│     [ ] new-year     1  439 KB   │ │                      │ │                      │
+│   [ ] 2024           1  1.4 MB   │ │                      │ │                      │
+└──────────────────────────────────┘ └──────────────────────┘ └──────────────────────┘
  Log: 2023\holidays\a.heic -> 2023\holidays\a.jpg  2.4 MB -> 310 KB (13%)
 ```
 
-- **Source pane**: the source folder is scanned in the background, with a
-  progress bar ("Scanning… N images in M folders"); the window stays
-  usable while big trees load. Folders that can't be read (e.g. a failing
-  drive) are listed in the log and skipped. Two views:
-  - **Files**: a list of images. *Include subfolders* lists images in all
-    subfolders too. *Convert* uses the selected files, or all listed files
-    when none is selected.
-  - **Folders**: a tree of the folders that contain images, with tick
-    boxes and image counts ("Images" = directly in the folder,
-    "Incl. subfolders" = with all subfolders). Ticking a folder ticks all
-    its subfolders; you can then untick single ones. *Convert* uses the
-    images in the ticked folders.
-- **Target pane**: the target folder. Double-click a file to open it.
-  The target must not be the source folder or inside it.
+The GUI is made for mass conversion of big photo trees (often on a USB
+or HDD drive), so it reads the disk as little as possible.
+
+- **Source pane** has two views. The app always starts in **Folders**
+  view (this is not remembered).
+  - **Folders** (mass convert): shows **folders only**, never files. At
+    start only the list of the source's top-level folders is read; a
+    folder's subfolders are read when you expand it. Tick the folders to
+    convert: ticking a folder includes it and **all its subfolders** (also
+    ones you haven't expanded); you can then untick single subfolders.
+    - **Scan folders** reads the whole tree once and shows, next to each
+      folder, its image count and size (subfolders included), and on top
+      the total and the ticked total. It is not done automatically. After
+      a Convert run the numbers are cleared (they may have changed); press
+      Scan folders again if you need them.
+    - **Convert** reads only the ticked folders, lists their images, then
+      converts them.
+    - **Preview** uses the first image directly inside the highlighted
+      folder.
+  - **Files**: a list of images, read only when you open this tab.
+    *Include subfolders* lists images in all subfolders too. *Convert*
+    uses the selected files, or all listed files when none is selected.
+  - Reading runs in the background with a progress bar ("Scanning… N
+    images in M folders"); the window stays usable. Folders that can't be
+    read (e.g. a failing drive) are written to the log and skipped.
+- **Target pane**: the target folder. Its file list is read only when
+  you press **Refresh** (and after a Files-view run), not at start.
+  Double-click a file to open it. The target must not be the source
+  folder or inside it.
 - **Folder structure is kept**: the path below the source folder is
   repeated below the target folder, with the same file names (only the
   extension follows the target format):
@@ -158,14 +175,15 @@ of the screen.
 - **Preview**: converts one image and shows it at **1:1 size**, not
   shrunk to the screen, so you see the real result resolution and JPG
   quality. In the Files view it uses the selected file (double-click works
-  too); in the Folders view, the first image of the highlighted folder.
+  too); in the Folders view, the first image directly inside the
+  highlighted folder.
   Scroll or drag to pan; `Esc` closes. The overlay shows
   `original -> converted` size, file size with percent, and the detected
   category.
 - **Stop** stops after the current file.
-- **Settings are remembered**: source and target folders, the view,
-  ticked folders, resize / format / quality, Move, Auto categorize and the
-  ticked categories. They are saved as soon as they change (in
+- **Settings are remembered**: source and target folders, ticked folders,
+  resize / format / quality, Move, Auto categorize and the ticked
+  categories (not the view: the app always starts in Folders view). They are saved as soon as they change (in
   `%APPDATA%\MediaOrganizer\gui.json`).
 
 Per file the order is: convert in memory → detect the category on the

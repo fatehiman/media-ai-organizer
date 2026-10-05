@@ -359,20 +359,32 @@ were worse than 0.5.
   worker — e.g. the ticked categories are copied into a `set` in the UI
   thread before the worker starts ("main thread is not in main loop"
   otherwise).
-- **Folder scans** (`scan_images`): run in their own thread per pane
-  (source / target), so a huge or slow tree never blocks the window. They
-  use an explicit stack + `os.scandir`; on Windows `DirEntry.stat()` is
-  served from the directory listing, so sizes cost no extra disk access
-  (30,000 files in 300 folders: ~1.2 s incl. filling the UI). An
-  `OSError` on one folder is recorded and the scan goes on. Each scan has
-  a generation number and a cancel `Event`; results of an older scan are
-  ignored. Convert / Preview are disabled while the source is scanning.
-- **Folders view**: a `ttk.Treeview` built from the scan (folders that
-  hold images + their parents). Item id = `"/" + <path relative to the
-  source, posix>` (`"/"` is the source root; Treeview ids can't be
-  empty). Tick boxes are two small PIL-drawn images; a click on the
-  `image` element toggles, cascading to all descendants. Ticked folders
-  are kept as relative paths, so they survive a rescan and a restart.
+- **Low disk IO** (mass conversion of big USB / HDD trees):
+  - Folders view (the start view, not saved) never lists files. At start
+    it reads one directory (the source's top level). Each folder gets a
+    placeholder child (`<iid>|dummy`; `|` can't be in a Windows file
+    name) and is read on `<<TreeviewOpen>>`.
+  - "Scan folders" walks the whole tree once (counts + sizes per folder;
+    the tree is rebuilt fully loaded, open folders stay open).
+  - Convert in Folders view walks only folders that are ticked or have a
+    ticked descendant (`want_dir`), then converts.
+  - Files view reads files when its tab is opened (non-recursive unless
+    *Include subfolders*). The target list is read only on Refresh and
+    after a Files-view run. After a Folders-view run the counts are only
+    cleared, not re-read.
+- **Walker** (`_walk`): explicit stack + `os.scandir`; on Windows
+  `DirEntry.stat()` / `is_dir()` come from the directory listing, so no
+  extra disk access per file. Folder keys are posix paths relative to the
+  source (`""` = root). An `OSError` on one folder is recorded and the
+  walk goes on. Background scans have a global generation number and a
+  cancel `Event`; results of older scans are ignored. Convert / Preview
+  are disabled while the source is scanning. 30,000 images in 300
+  folders: Scan folders ~0.4 s, longest UI pause ~60 ms.
+- **Tick states**: `states` holds only explicit states; a folder without
+  one follows its nearest ancestor (default off). Ticking a folder sets
+  its state and drops all descendant states, so unloaded subfolders
+  follow too. States are saved with the source path they belong to
+  (`folder_states_source`) and reset when the source changes.
 - **Output path**: `<target>/<source-relative dir>/[<category>/]<stem>.<ext>`
   in both views. A target equal to or inside the source is refused
   (otherwise outputs would be listed and converted again).
@@ -420,7 +432,8 @@ were worse than 0.5.
   after its output was written successfully.
 - **Settings**: `%APPDATA%\MediaOrganizer\gui.json`. Every Tk variable
   has a write trace that saves 0.5 s after the last change (and on
-  close), so settings survive a crash or a killed process.
+  close), so settings survive a crash or a killed process. The view is
+  deliberately not saved.
 - **Config**: the GUI loads `media-organizer.conf` with
   `require_paths=False` (it picks its own folders). Category checkboxes
   are the `image-<folder>` names; unticked / low-confidence →
