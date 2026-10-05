@@ -105,26 +105,46 @@ again — it will offer to resume from where it stopped.
 
 ## GUI: convert & categorize
 
-Double-click `media-organizer-gui.exe`.
+Double-click `media-organizer-gui.exe`. The window opens in the center
+of the screen.
 
 ```
-┌ Source ───────────┐ ┌ Options ─────────────┐ ┌ Target ───────────┐
-│ folder [Browse]   │ │ Resize: keep / % /   │ │ folder [Browse]   │
-│ IMG_0001.HEIC     │ │   width / height     │ │ personal\a.jpg    │
-│ IMG_0002.PNG      │ │ Format: JPG / PNG    │ │ objects\b.jpg     │
-│ ...               │ │   JPG quality 1-100  │ │ ...               │
-│ [ ] subfolders    │ │ [ ] Move (del source)│ │ [Refresh]         │
-│                   │ │ [ ] Auto categorize  │ │                   │
-│                   │ │     [x] personal ... │ │                   │
-│                   │ │ [Preview] [Convert]  │ │                   │
-└───────────────────┘ └──────────────────────┘ └───────────────────┘
- Log: IMG_0001.HEIC -> personal\IMG_0001.jpg  2.4 MB -> 310 KB (13%)
+┌ Source ─────────────────┐ ┌ Options ─────────────┐ ┌ Target ───────────────┐
+│ folder [Browse]         │ │ Resize: keep / % /   │ │ folder [Browse]       │
+│ 1,234 images, 2.1 GB    │ │   width / height     │ │ 2023\holidays\a.jpg   │
+│ [Files] [Folders]       │ │ Format: JPG / PNG    │ │ 2023\other\b.jpg      │
+│ [x] t_src          1  6 │ │   JPG quality 1-100  │ │ ...                   │
+│   [x] 2023         0  3 │ │ [ ] Move (del source)│ │ [Refresh]             │
+│     [x] holidays   2  2 │ │ [ ] Auto categorize  │ │                       │
+│     [ ] new-year   1  1 │ │     [x] personal ... │ │                       │
+│   [ ] 2024         1  1 │ │ [Preview] [Convert]  │ │                       │
+└─────────────────────────┘ └──────────────────────┘ └───────────────────────┘
+ Log: 2023\holidays\a.heic -> 2023\holidays\a.jpg  2.4 MB -> 310 KB (13%)
 ```
 
-- **Left pane**: the source folder and its images (JPG, PNG, HEIC, WEBP,
-  … — the `ext-image` list of the conf). Tick *Include subfolders* to list
-  images in subfolders too.
-- **Right pane**: the target folder. Double-click a file to open it.
+- **Source pane**: the source folder is scanned in the background, with a
+  progress bar ("Scanning… N images in M folders"); the window stays
+  usable while big trees load. Folders that can't be read (e.g. a failing
+  drive) are listed in the log and skipped. Two views:
+  - **Files**: a list of images. *Include subfolders* lists images in all
+    subfolders too. *Convert* uses the selected files, or all listed files
+    when none is selected.
+  - **Folders**: a tree of the folders that contain images, with tick
+    boxes and image counts ("Images" = directly in the folder,
+    "Incl. subfolders" = with all subfolders). Ticking a folder ticks all
+    its subfolders; you can then untick single ones. *Convert* uses the
+    images in the ticked folders.
+- **Target pane**: the target folder. Double-click a file to open it.
+  The target must not be the source folder or inside it.
+- **Folder structure is kept**: the path below the source folder is
+  repeated below the target folder, with the same file names (only the
+  extension follows the target format):
+
+  | Source | Auto categorize off | Auto categorize on (category `other`) |
+  |---|---|---|
+  | `<source>\2023\holidays\202309110945.heic` | `<target>\2023\holidays\202309110945.jpg` | `<target>\2023\holidays\other\202309110945.jpg` |
+  | `<source>\IMG_1.png` | `<target>\IMG_1.jpg` | `<target>\other\IMG_1.jpg` |
+
 - **Resize**: *Keep size*, *Percent*, *Width* or *Height* in pixels. The
   aspect ratio is always kept, and images are **never enlarged**.
 - **Target format**: JPG (with a quality slider) or PNG.
@@ -132,17 +152,21 @@ Double-click `media-organizer-gui.exe`.
   source goes to the Recycle Bin (no prompt). This happens file by file,
   not at the end. On drives without a Recycle Bin (some USB sticks,
   network shares) Windows deletes the file permanently.
-- **Auto categorize**: sorts the output into `target\<category>\`. Only
+- **Auto categorize**: adds a category folder (see the table). Only
   ticked categories are used; an image whose category is not ticked goes
-  to `target\other\`. Without *Auto categorize*, files go straight into
-  the target folder.
-- **Preview**: converts the selected image (double-click works too) and
-  shows it at **1:1 size**, not shrunk to the screen, so you see the real
-  result resolution and JPG quality. Scroll or drag to pan; `Esc` closes.
-  The overlay shows `original -> converted` size, file size with percent,
-  and the detected category.
-- **Convert**: works on the selected images, or on all of them when none
-  is selected. *Stop* stops after the current file.
+  to the `other` folder.
+- **Preview**: converts one image and shows it at **1:1 size**, not
+  shrunk to the screen, so you see the real result resolution and JPG
+  quality. In the Files view it uses the selected file (double-click works
+  too); in the Folders view, the first image of the highlighted folder.
+  Scroll or drag to pan; `Esc` closes. The overlay shows
+  `original -> converted` size, file size with percent, and the detected
+  category.
+- **Stop** stops after the current file.
+- **Settings are remembered**: source and target folders, the view,
+  ticked folders, resize / format / quality, Move, Auto categorize and the
+  ticked categories. They are saved as soon as they change (in
+  `%APPDATA%\MediaOrganizer\gui.json`).
 
 Per file the order is: convert in memory → detect the category on the
 small converted image (faster than on the big original) → save → recycle

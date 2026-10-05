@@ -3,13 +3,20 @@ Media Organizer GUI (Tkinter): convert / resize images, optionally
 auto-categorize them with the same CLIP pipeline as the CLI, and optionally
 send each source to the Recycle Bin.
 
-Layout:   [ Source folder + file list ] [ options + buttons ] [ Target folder + file list ]
-          [ log ......................................................................... ]
+Layout:   [ Source: Files | Folders tabs ] [ options + buttons ] [ Target file list ]
+          [ log ........................................................................ ]
+
+Folder scans run in a background thread (os.scandir: file sizes come with
+the directory listing on Windows), so big trees don't freeze the window.
+
+The source folder structure is mirrored in the target:
+    <source>/2023/holidays/x.heic -> <target>/2023/holidays/x.jpg
+    with auto categorize:         -> <target>/2023/holidays/<category>/x.jpg
 
 Per file (one at a time, in a worker thread):
     convert in memory -> categorize the small converted image (using the
-    source file's metadata) -> write target/<category>/<name>.<ext>
-    -> send source to the Recycle Bin (if "Move (del source)" is ticked).
+    source file's metadata) -> write the output -> send the source to the
+    Recycle Bin (if "Move (del source)" is ticked).
 """
 
 from __future__ import annotations
@@ -22,9 +29,9 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 from . import __version__
 from . import config as config_module
@@ -34,6 +41,11 @@ from .trash import send_to_recycle_bin
 
 
 _PAD = 6
+_WIN_W, _WIN_H = 1280, 760
+_FILES_TAB, _FOLDERS_TAB = 0, 1
+
+# One scanned image: (absolute path, size in bytes).
+ScanEntry = Tuple[Path, int]
 
 
 def _human(n: float) -> str:
@@ -54,12 +66,66 @@ def _config_path() -> Path:
     return near_exe if near_exe.exists() else Path.cwd() / "media-organizer.conf"
 
 
+def _center(win: tk.Misc, w: int, h: int) -> None:
+    """Size `win` to w x h (clipped to the screen) and center it."""
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h = min(w, sw - 40), min(h, sh - 80)
+    win.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}")
+
+
+def scan_images(
+    root: Path,
+    exts: Set[str],
+    cancel: threading.Event,
+    progress: Callable[[int, int], None],
+) -> Tuple[List[ScanEntry], List[str]]:
+    """Recursively list images under root.  Returns (entries, errors).
+    A folder that can't be read is reported in `errors` and skipped, so a
+    failing drive doesn't stop (or crash) the whole scan."""
+    found: List[ScanEntry] = []
+    errors: List[str] = []
+    stack = [root]
+    n_dirs = 0
+    while stack and not cancel.is_set():
+        folder = stack.pop()
+        n_dirs += 1
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif os.path.splitext(entry.name)[1].lower() in exts:
+                            found.append((Path(entry.path), entry.stat().st_size))
+                    except OSError as e:
+                        errors.append(f"{entry.path}: {e}")
+        except OSError as e:
+            errors.append(f"{folder}: {e}")
+        if n_dirs % 20 == 0:
+            progress(n_dirs, len(found))
+    progress(n_dirs, len(found))
+    found.sort(key=lambda e: str(e[0]).lower())
+    return found, errors
+
+
+def _checkbox_images() -> Tuple[ImageTk.PhotoImage, ImageTk.PhotoImage]:
+    """Small unchecked / checked box images for the folder tree."""
+    def box(checked: bool) -> ImageTk.PhotoImage:
+        im = Image.new("RGBA", (14, 14), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.rectangle([0, 0, 13, 13], fill="white", outline="#555")
+        if checked:
+            d.line([(3, 7), (6, 10), (11, 3)], fill="#0a64c8", width=2)
+        return ImageTk.PhotoImage(im)
+    return box(False), box(True)
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Media Organizer {__version__} - Convert & Categorize")
-        self.geometry("1280x760")
         self.minsize(1000, 600)
+        _center(self, _WIN_W, _WIN_H)
 
         try:
             self.cfg = config_module.load(_config_path(), require_paths=False)
@@ -67,24 +133,35 @@ class App(tk.Tk):
             messagebox.showerror("Config error", str(e))
             raise SystemExit(2)
         self.categories: List[str] = list(self.cfg.image_folders)
+        self.exts: Set[str] = set(self.cfg.ext_image)
 
-        self.src_files: List[Path] = []
+        # Scan results.  src_root is the folder the scan belongs to.
+        self.src_root: Optional[Path] = None
+        self.src_scan: List[ScanEntry] = []
+        self.src_files: List[Path] = []          # rows of the Files list
         self.dst_files: List[Path] = []
+        self.scans: Dict[str, Tuple[int, threading.Event]] = {}
+        self.checked: Set[str] = set()           # tree folders, rel. posix paths
+
         self.msgs: "queue.Queue[tuple]" = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
         self.models_ready = False
+        self._save_job: Optional[str] = None
+        self._poll_job: Optional[str] = None
 
         self._make_vars()
         self._load_settings()
+        self.box_off, self.box_on = _checkbox_images()
         self._build()
-        self._refresh_src()
-        self._refresh_dst()
+        self._watch_vars()
         self._sync_states()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
+        self.after(150, self._refresh_src)
+        self.after(150, self._refresh_dst)
 
-    # --- state ---------------------------------------------------------------
+    # --- settings ------------------------------------------------------------
 
     def _make_vars(self) -> None:
         self.v_src = tk.StringVar()
@@ -102,19 +179,22 @@ class App(tk.Tk):
             c: tk.BooleanVar(value=True) for c in self.categories
         }
         self.v_status = tk.StringVar(value="Ready.")
+        self.view_tab = _FILES_TAB
+
+    def _simple_vars(self) -> Dict[str, tk.Variable]:
+        return {
+            "src": self.v_src, "dst": self.v_dst, "subfolders": self.v_subfolders,
+            "resize": self.v_resize, "percent": self.v_percent,
+            "width": self.v_width, "height": self.v_height, "fmt": self.v_fmt,
+            "quality": self.v_quality, "move": self.v_move, "auto": self.v_auto,
+        }
 
     def _load_settings(self) -> None:
         try:
             data = json.loads(_settings_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        simple = {
-            "src": self.v_src, "dst": self.v_dst, "subfolders": self.v_subfolders,
-            "resize": self.v_resize, "percent": self.v_percent,
-            "width": self.v_width, "height": self.v_height, "fmt": self.v_fmt,
-            "quality": self.v_quality, "move": self.v_move, "auto": self.v_auto,
-        }
-        for key, var in simple.items():
+        for key, var in self._simple_vars().items():
             if key in data:
                 try:
                     var.set(data[key])
@@ -123,24 +203,37 @@ class App(tk.Tk):
         for c, on in data.get("categories", {}).items():
             if c in self.v_cats:
                 self.v_cats[c].set(bool(on))
+        self.checked = set(data.get("checked_folders", []))
+        self.view_tab = _FOLDERS_TAB if data.get("view") == "folders" else _FILES_TAB
 
     def _save_settings(self) -> None:
-        data = {
-            "src": self.v_src.get(), "dst": self.v_dst.get(),
-            "subfolders": self.v_subfolders.get(), "resize": self.v_resize.get(),
-            "percent": self._int(self.v_percent, 50),
-            "width": self._int(self.v_width, 1920),
-            "height": self._int(self.v_height, 1920),
-            "fmt": self.v_fmt.get(), "quality": self._int(self.v_quality, 85),
-            "move": self.v_move.get(), "auto": self.v_auto.get(),
-            "categories": {c: v.get() for c, v in self.v_cats.items()},
-        }
+        self._save_job = None
+        data = {}
+        for key, var in self._simple_vars().items():
+            try:
+                data[key] = var.get()
+            except tk.TclError:          # e.g. a half-typed spinbox value
+                pass
+        data["categories"] = {c: v.get() for c, v in self.v_cats.items()}
+        data["checked_folders"] = sorted(self.checked)
+        data["view"] = "folders" if self._tab() == _FOLDERS_TAB else "files"
         try:
             p = _settings_path()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    def _schedule_save(self, *_args) -> None:
+        """Save shortly after any change (so settings survive a crash or a
+        killed process, not only a normal close)."""
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(500, self._save_settings)
+
+    def _watch_vars(self) -> None:
+        for var in list(self._simple_vars().values()) + list(self.v_cats.values()):
+            var.trace_add("write", self._schedule_save)
 
     @staticmethod
     def _int(var: tk.IntVar, default: int) -> int:
@@ -169,24 +262,9 @@ class App(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(0, weight=1)
-
-        left = self._file_pane(0, "Source", self.v_src, self._browse_src)
-        self.src_list = left
-        ttk.Checkbutton(
-            left.master, text="Include subfolders", variable=self.v_subfolders,
-            command=self._refresh_src,
-        ).grid(row=3, column=0, columnspan=3, sticky="w")
-        self.src_list.configure(selectmode=tk.EXTENDED)
-        self.src_list.bind("<Double-Button-1>", lambda e: self._preview())
-        self.src_list.bind("<<ListboxSelect>>", lambda e: self._update_count())
-
-        right = self._file_pane(2, "Target", self.v_dst, self._browse_dst)
-        self.dst_list = right
-        ttk.Button(right.master, text="Refresh", command=self._refresh_dst).grid(
-            row=3, column=0, sticky="w")
-        self.dst_list.bind("<Double-Button-1>", self._open_dst)
-
-        self._center(1)
+        self._source_pane(0)
+        self._center_pane(1)
+        self._target_pane(2)
 
         logf = ttk.LabelFrame(self, text="Log")
         logf.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=_PAD, pady=(0, _PAD))
@@ -197,26 +275,103 @@ class App(tk.Tk):
         self.log.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
 
-    def _file_pane(self, col: int, title: str, var: tk.StringVar, browse) -> tk.Listbox:
-        frame = ttk.LabelFrame(self, text=title)
-        frame.grid(row=0, column=col, sticky="nsew", padx=_PAD, pady=_PAD)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+    def _path_row(self, frame: ttk.Frame, var: tk.StringVar, browse, refresh) -> None:
         entry = ttk.Entry(frame, textvariable=var)
         entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        entry.bind("<Return>", lambda e: (self._refresh_src(), self._refresh_dst()))
+        entry.bind("<Return>", lambda e: refresh())
         ttk.Button(frame, text="Browse...", command=browse).grid(row=0, column=1)
-        count = ttk.Label(frame, text="")
-        count.grid(row=1, column=0, columnspan=2, sticky="w")
-        lb = tk.Listbox(frame, activestyle="none", exportselection=False)
-        sb = ttk.Scrollbar(frame, command=lb.yview)
-        lb.configure(yscrollcommand=sb.set)
-        lb.grid(row=2, column=0, sticky="nsew")
-        sb.grid(row=2, column=1, sticky="ns")
-        lb.count_label = count  # type: ignore[attr-defined]
-        return lb
 
-    def _center(self, col: int) -> None:
+    def _scan_row(self, frame: ttk.Frame, row: int) -> Tuple[ttk.Label, ttk.Progressbar]:
+        info = ttk.Label(frame, text="")
+        info.grid(row=row, column=0, columnspan=2, sticky="w")
+        bar = ttk.Progressbar(frame, mode="indeterminate")
+        bar.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        bar.grid_remove()
+        return info, bar
+
+    def _source_pane(self, col: int) -> None:
+        frame = ttk.LabelFrame(self, text="Source")
+        frame.grid(row=0, column=col, sticky="nsew", padx=_PAD, pady=_PAD)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        self._path_row(frame, self.v_src, self._browse_src, self._refresh_src)
+        self.src_info, self.src_bar = self._scan_row(frame, 1)
+
+        self.tabs = ttk.Notebook(frame)
+        self.tabs.grid(row=3, column=0, columnspan=2, sticky="nsew")
+
+        # Files view
+        ft = ttk.Frame(self.tabs)
+        ft.columnconfigure(0, weight=1)
+        ft.rowconfigure(0, weight=1)
+        self.src_list = tk.Listbox(ft, activestyle="none", exportselection=False,
+                                   selectmode=tk.EXTENDED)
+        sb = ttk.Scrollbar(ft, command=self.src_list.yview)
+        self.src_list.configure(yscrollcommand=sb.set)
+        self.src_list.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        ttk.Checkbutton(ft, text="Include subfolders", variable=self.v_subfolders,
+                        command=self._fill_src_list).grid(row=1, column=0, sticky="w")
+        ttk.Label(ft, text="Convert = selected files, or all listed if none selected",
+                  foreground="gray").grid(row=2, column=0, sticky="w")
+        self.src_list.bind("<Double-Button-1>", lambda e: self._preview())
+        self.src_list.bind("<<ListboxSelect>>", lambda e: self._update_count())
+        self.tabs.add(ft, text="Files")
+
+        # Folders view
+        dt = ttk.Frame(self.tabs)
+        dt.columnconfigure(0, weight=1)
+        dt.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(dt, columns=("here", "all"), selectmode="browse")
+        self.tree.heading("#0", text="Folder")
+        self.tree.heading("here", text="Images")
+        self.tree.heading("all", text="Incl. subfolders")
+        self.tree.column("#0", width=230, stretch=True)
+        self.tree.column("here", width=60, anchor="e", stretch=False)
+        self.tree.column("all", width=100, anchor="e", stretch=False)
+        tsb = ttk.Scrollbar(dt, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tsb.grid(row=0, column=1, sticky="ns")
+        btns = ttk.Frame(dt)
+        btns.grid(row=1, column=0, sticky="w")
+        ttk.Button(btns, text="Check all",
+                   command=lambda: self._check_all(True)).pack(side="left")
+        ttk.Button(btns, text="Uncheck all",
+                   command=lambda: self._check_all(False)).pack(side="left", padx=4)
+        ttk.Label(dt, text="Ticking a folder ticks its subfolders too. "
+                           "Convert = images in ticked folders.",
+                  foreground="gray").grid(row=2, column=0, sticky="w")
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._on_tree_space)
+        self.tree.bind("<Double-Button-1>", lambda e: "break")   # no expand toggle
+        self.tabs.add(dt, text="Folders")
+
+        self.tabs.select(self.view_tab)
+        self.tabs.bind("<<NotebookTabChanged>>",
+                       lambda e: (self._update_count(), self._schedule_save()))
+
+    def _target_pane(self, col: int) -> None:
+        frame = ttk.LabelFrame(self, text="Target  (source folder structure is kept)")
+        frame.grid(row=0, column=col, sticky="nsew", padx=_PAD, pady=_PAD)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        self._path_row(frame, self.v_dst, self._browse_dst, self._refresh_dst)
+        self.dst_info, self.dst_bar = self._scan_row(frame, 1)
+        lf = ttk.Frame(frame)
+        lf.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+        self.dst_list = tk.Listbox(lf, activestyle="none", exportselection=False)
+        sb = ttk.Scrollbar(lf, command=self.dst_list.yview)
+        self.dst_list.configure(yscrollcommand=sb.set)
+        self.dst_list.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        ttk.Button(frame, text="Refresh", command=self._refresh_dst).grid(
+            row=4, column=0, sticky="w")
+        self.dst_list.bind("<Double-Button-1>", self._open_dst)
+
+    def _center_pane(self, col: int) -> None:
         c = ttk.Frame(self)
         c.grid(row=0, column=col, sticky="ns", pady=_PAD)
 
@@ -272,9 +427,7 @@ class App(tk.Tk):
         self.btn_convert = ttk.Button(c, text="Convert", command=self._convert)
         self.btn_convert.pack(fill="x", pady=2)
         self.btn_stop = ttk.Button(c, text="Stop", command=self.stop_event.set)
-        self.btn_stop.pack(fill="x", pady=2)
-        ttk.Label(c, text="Convert = selected files,\nor all if none selected",
-                  foreground="gray", justify="center").pack(pady=(0, _PAD))
+        self.btn_stop.pack(fill="x", pady=(2, _PAD))
 
         self.progress = ttk.Progressbar(c, mode="determinate")
         self.progress.pack(fill="x")
@@ -284,6 +437,12 @@ class App(tk.Tk):
         self.v_quality.set(int(float(value)))
         self.q_label.configure(text=str(self.v_quality.get()))
 
+    def _tab(self) -> int:
+        try:
+            return self.tabs.index(self.tabs.select())
+        except (AttributeError, tk.TclError):
+            return self.view_tab
+
     def _sync_states(self) -> None:
         for mode, sp in self.spins.items():
             sp.configure(state="normal" if self.v_resize.get() == mode else "disabled")
@@ -292,11 +451,13 @@ class App(tk.Tk):
         for cb in self.cat_checks:
             cb.configure(state="normal" if self.v_auto.get() else "disabled")
         busy = self.worker is not None and self.worker.is_alive()
-        self.btn_convert.configure(state="disabled" if busy else "normal")
-        self.btn_preview.configure(state="disabled" if busy else "normal")
+        scanning = "src" in self.scans
+        state = "disabled" if busy or scanning else "normal"
+        self.btn_convert.configure(state=state)
+        self.btn_preview.configure(state=state)
         self.btn_stop.configure(state="normal" if busy else "disabled")
 
-    # --- file lists ------------------------------------------------------------
+    # --- scanning ----------------------------------------------------------------
 
     def _browse_src(self) -> None:
         d = filedialog.askdirectory(initialdir=self.v_src.get() or None)
@@ -310,48 +471,171 @@ class App(tk.Tk):
             self.v_dst.set(os.path.normpath(d))
             self._refresh_dst()
 
-    def _list_images(self, folder: str, recursive: bool) -> List[Path]:
-        # An empty entry must list nothing (Path("") would mean the cwd).
+    def _start_scan(self, pane: str, folder: str) -> None:
+        """Scan `folder` in a background thread; results arrive as a
+        ("scan_done", pane, ...) message.  A newer scan of the same pane
+        cancels the older one."""
+        old = self.scans.pop(pane, None)
+        if old:
+            old[1].set()
+        info, bar = (self.src_info, self.src_bar) if pane == "src" else (
+            self.dst_info, self.dst_bar)
         root = Path(folder.strip())
+        # An empty entry must list nothing (Path("") would mean the cwd).
         if not folder.strip() or not root.is_dir():
-            return []
-        exts = set(self.cfg.ext_image)
-        found: List[Path] = []
-        try:
-            for p in (root.rglob("*") if recursive else root.iterdir()):
-                if p.suffix.lower() in exts and p.is_file():
-                    found.append(p)
-        except OSError as e:
-            # e.g. a failing / disconnected drive: show what was found so
-            # far instead of crashing the app.
-            self._log(f"ERROR reading {root}: {e}")
-            messagebox.showwarning("Folder read error", f"Cannot fully read:\n{root}\n\n{e}")
-        return sorted(found)
+            self._scan_finished(pane, root, [], [])
+            info.configure(text="Folder not found." if folder.strip() else "")
+            return
+        gen = (old[0] + 1) if old else 1
+        cancel = threading.Event()
+        self.scans[pane] = (gen, cancel)
+        info.configure(text="Scanning...")
+        bar.grid()
+        bar.start(12)
+        self._sync_states()
 
-    def _fill(self, lb: tk.Listbox, root: Path, files: List[Path]) -> None:
-        lb.delete(0, tk.END)
-        total = 0
-        for p in files:
-            try:
-                size = p.stat().st_size
-            except OSError:
-                size = 0
-            total += size
-            lb.insert(tk.END, f"{p.relative_to(root)}   ({_human(size)})")
-        lb.count_label.configure(  # type: ignore[attr-defined]
-            text=f"{len(files)} images, {_human(total)}")
+        def progress(n_dirs: int, n_images: int) -> None:
+            self.msgs.put(("scan_progress", pane, gen,
+                           f"Scanning... {n_images:,} images in {n_dirs:,} folders"))
+
+        def run() -> None:
+            files, errors = scan_images(root, self.exts, cancel, progress)
+            if not cancel.is_set():
+                self.msgs.put(("scan_done", pane, gen, root, files, errors))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _refresh_src(self) -> None:
-        self.src_files = self._list_images(self.v_src.get(), self.v_subfolders.get())
-        self._fill(self.src_list, Path(self.v_src.get().strip()), self.src_files)
+        self._start_scan("src", self.v_src.get())
 
     def _refresh_dst(self) -> None:
-        self.dst_files = self._list_images(self.v_dst.get(), True)
-        self._fill(self.dst_list, Path(self.v_dst.get().strip()), self.dst_files)
+        self._start_scan("dst", self.v_dst.get())
+
+    def _scan_finished(self, pane: str, root: Path, files: List[ScanEntry],
+                       errors: List[str]) -> None:
+        self.scans.pop(pane, None)
+        bar = self.src_bar if pane == "src" else self.dst_bar
+        bar.stop()
+        bar.grid_remove()
+        for e in errors[:20]:
+            self._log(f"ERROR reading {e}")
+        if len(errors) > 20:
+            self._log(f"... and {len(errors) - 20} more read errors")
+        total = sum(size for _p, size in files)
+        text = f"{len(files):,} images, {_human(total)}"
+        if errors:
+            text += f"  ({len(errors)} read errors, see log)"
+        if pane == "src":
+            self.src_root, self.src_scan = root, files
+            self.src_info.configure(text=text)
+            self._fill_src_list()
+            self._fill_tree()
+        else:
+            self.dst_files = [p for p, _s in files]
+            self.dst_list.delete(0, tk.END)
+            self.dst_list.insert(tk.END, *[
+                f"{p.relative_to(root)}   ({_human(s)})" for p, s in files])
+            self.dst_info.configure(text=text)
+        self._sync_states()
+
+    # --- files view --------------------------------------------------------------
+
+    def _fill_src_list(self) -> None:
+        root = self.src_root
+        rows = self.src_scan if self.v_subfolders.get() or root is None else [
+            e for e in self.src_scan if e[0].parent == root]
+        self.src_files = [p for p, _s in rows]
+        self.src_list.delete(0, tk.END)
+        if root is not None and rows:
+            self.src_list.insert(tk.END, *[
+                f"{p.relative_to(root)}   ({_human(s)})" for p, s in rows])
+        self._update_count()
+
+    # --- folders view ------------------------------------------------------------
+
+    @staticmethod
+    def _rel(root: Path, folder: Path) -> str:
+        rel = folder.relative_to(root).as_posix()
+        return "" if rel == "." else rel
+
+    def _fill_tree(self) -> None:
+        """Build the folder tree from the scan: every folder that holds
+        images, plus its parents.  Item id = folder path relative to the
+        source root ("" is the root itself)."""
+        self.tree.delete(*self.tree.get_children())
+        root = self.src_root
+        if root is None:
+            return
+        here: Dict[str, int] = {}
+        total: Dict[str, int] = {}
+        for p, _s in self.src_scan:
+            rel = self._rel(root, p.parent)
+            here[rel] = here.get(rel, 0) + 1
+            parts = rel.split("/") if rel else []
+            for i in range(len(parts) + 1):
+                key = "/".join(parts[:i])
+                total[key] = total.get(key, 0) + 1
+        if not total:
+            return
+        self.checked &= set(total)        # forget folders that are gone
+        for key in sorted(total, key=lambda k: (k.count("/"), k.lower())):
+            parent = key.rsplit("/", 1)[0] if "/" in key else ("" if key else None)
+            text = (root.name or str(root)) if key == "" else key.rsplit("/", 1)[-1]
+            self.tree.insert(
+                "" if parent is None else self._iid(parent), "end",
+                iid=self._iid(key), text=" " + text, open=key == "",
+                image=self.box_on if key in self.checked else self.box_off,
+                values=(f"{here.get(key, 0):,}", f"{total[key]:,}"),
+            )
+        self._update_count()
+
+    @staticmethod
+    def _iid(key: str) -> str:
+        return "/" + key            # Treeview ids must not be "" (root id)
+
+    def _set_checked(self, key: str, on: bool) -> None:
+        """Tick / untick a folder and all its subfolders."""
+        stack = [self._iid(key)]
+        while stack:
+            iid = stack.pop()
+            k = iid[1:]
+            (self.checked.add if on else self.checked.discard)(k)
+            self.tree.item(iid, image=self.box_on if on else self.box_off)
+            stack.extend(self.tree.get_children(iid))
+        self._update_count()
+        self._schedule_save()
+
+    def _on_tree_click(self, event) -> Optional[str]:
+        iid = self.tree.identify_row(event.y)
+        if iid and "image" in self.tree.identify_element(event.x, event.y):
+            key = iid[1:]
+            self._set_checked(key, key not in self.checked)
+            return "break"
+        return None
+
+    def _on_tree_space(self, _event) -> str:
+        iid = self.tree.focus()
+        if iid:
+            self._set_checked(iid[1:], iid[1:] not in self.checked)
+        return "break"
+
+    def _check_all(self, on: bool) -> None:
+        for iid in self.tree.get_children():
+            self._set_checked(iid[1:], on)
+
+    def _checked_files(self) -> List[Path]:
+        root = self.src_root
+        if root is None:
+            return []
+        return [p for p, _s in self.src_scan if self._rel(root, p.parent) in self.checked]
 
     def _update_count(self) -> None:
-        n = len(self.src_list.curselection())
-        self.v_status.set(f"{n} selected." if n else "Ready.")
+        if self._tab() == _FOLDERS_TAB:
+            n = len(self._checked_files())
+            self.v_status.set(f"{len(self.checked)} folders ticked, {n:,} images.")
+        else:
+            n = len(self.src_list.curselection())
+            self.v_status.set(f"{n} selected." if n else "Ready.")
 
     def _open_dst(self, _event) -> None:
         sel = self.dst_list.curselection()
@@ -366,6 +650,10 @@ class App(tk.Tk):
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
 
+    def _current_scan(self, pane: str, gen: int) -> bool:
+        cur = self.scans.get(pane)
+        return cur is not None and cur[0] == gen
+
     def _poll(self) -> None:
         try:
             while True:
@@ -377,35 +665,43 @@ class App(tk.Tk):
                     self.v_status.set(msg[1])
                 elif kind == "progress":
                     self.progress.configure(maximum=msg[2], value=msg[1])
+                elif kind == "scan_progress":
+                    if self._current_scan(msg[1], msg[2]):
+                        (self.src_info if msg[1] == "src" else self.dst_info).configure(
+                            text=msg[3])
+                elif kind == "scan_done":
+                    if self._current_scan(msg[1], msg[2]):
+                        self._scan_finished(msg[1], msg[3], msg[4], msg[5])
                 elif kind == "preview":
                     PreviewWindow(self, *msg[1:])
                 elif kind == "done":
                     self.worker = None
                     self._sync_states()
-                    self._refresh_src()
-                    self._refresh_dst()
+                    if msg[1]:                      # files were written / moved
+                        self._refresh_src()
+                        self._refresh_dst()
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
 
     # --- work ------------------------------------------------------------------
 
-    def _start(self, target, *args) -> None:
+    def _start(self, target, *args, rescan: bool = True) -> None:
         self._save_settings()
         self.stop_event.clear()
-        self.worker = threading.Thread(target=self._guard, args=(target, *args),
-                                       daemon=True)
+        self.worker = threading.Thread(target=self._guard,
+                                       args=(target, rescan, *args), daemon=True)
         self.worker.start()
         self._sync_states()
 
-    def _guard(self, target, *args) -> None:
+    def _guard(self, target, rescan: bool, *args) -> None:
         try:
             target(*args)
         except Exception as e:      # never leave the UI stuck in "busy"
             self.msgs.put(("log", f"ERROR: {e}"))
             self.msgs.put(("status", f"Error: {e}"))
         finally:
-            self.msgs.put(("done",))
+            self.msgs.put(("done", rescan))
 
     def _ensure_models(self) -> None:
         """Load CLIP once, in the worker thread (takes a few seconds)."""
@@ -437,13 +733,26 @@ class App(tk.Tk):
         return folder, r
 
     def _preview(self) -> None:
-        sel = self.src_list.curselection()
-        if not sel:
-            messagebox.showinfo("Preview", "Select an image in the left list first.")
-            return
+        if self._tab() == _FOLDERS_TAB:
+            iid = self.tree.focus()
+            root = self.src_root
+            files = [p for p, _s in self.src_scan
+                     if root is not None and iid and self._rel(root, p.parent) == iid[1:]]
+            if not files:
+                messagebox.showinfo("Preview", "Click a folder that contains images "
+                                               "(its first image is previewed), or use "
+                                               "the Files tab.")
+                return
+            path = files[0]
+        else:
+            sel = self.src_list.curselection()
+            if not sel:
+                messagebox.showinfo("Preview", "Select an image in the Files list first.")
+                return
+            path = self.src_files[sel[0]]
         ticked = self._ticked() if self.v_auto.get() else None
-        self._start(self._do_preview, self.src_files[sel[0]], self._convert_options(),
-                    ticked)
+        self._start(self._do_preview, path, self._convert_options(), ticked,
+                    rescan=False)
 
     def _do_preview(self, path: Path, opts: conv.ConvertOptions,
                     ticked: Optional[Set[str]]) -> None:
@@ -459,23 +768,37 @@ class App(tk.Tk):
         self.msgs.put(("status", "Ready."))
 
     def _convert(self) -> None:
-        if not self.src_files:
+        root = self.src_root
+        dst = self.v_dst.get().strip()
+        if root is None or not self.src_scan:
             messagebox.showinfo("Convert", "No images in the source folder.")
             return
-        dst = self.v_dst.get().strip()
         if not dst:
             messagebox.showinfo("Convert", "Choose a target folder first.")
             return
-        sel = self.src_list.curselection()
-        files = [self.src_files[i] for i in sel] if sel else list(self.src_files)
+        dst_root = Path(dst).resolve()
+        if dst_root == root.resolve() or root.resolve() in dst_root.parents:
+            messagebox.showerror("Convert", "The target folder must not be the source "
+                                            "folder or inside it.")
+            return
+        if self._tab() == _FOLDERS_TAB:
+            files = self._checked_files()
+            if not files:
+                messagebox.showinfo("Convert", "Tick at least one folder that "
+                                               "contains images.")
+                return
+        else:
+            sel = self.src_list.curselection()
+            files = [self.src_files[i] for i in sel] if sel else list(self.src_files)
         ticked = self._ticked() if self.v_auto.get() else None
-        self._start(self._do_convert, files, Path(dst), self._convert_options(),
+        self._start(self._do_convert, files, root, dst_root, self._convert_options(),
                     self.v_move.get(), ticked)
 
-    def _do_convert(self, files: List[Path], dst_root: Path,
+    def _do_convert(self, files: List[Path], src_root: Path, dst_root: Path,
                     opts: conv.ConvertOptions, move: bool,
                     ticked: Optional[Set[str]]) -> None:
-        """`ticked` is None when auto categorize is off."""
+        """Mirror the source structure: <dst>/<rel dir>/[<category>/]<name>.
+        `ticked` is None when auto categorize is off."""
         auto = ticked is not None
         n = len(files)
         before = after = 0
@@ -491,13 +814,13 @@ class App(tk.Tk):
             self.msgs.put(("status", f"{i}/{n}: {path.name}"))
             try:
                 c = conv.convert(path, opts)
-                folder = ""
+                out_dir = dst_root / path.parent.relative_to(src_root)
                 if ticked is not None:
                     folder, _r = self._categorize(path, c, ticked)
-                out_dir = dst_root / folder if folder else dst_root
+                    out_dir = out_dir / folder
                 out = conv.unique_path(out_dir, path.stem, opts.ext)
                 conv.write_output(out, c.data, path)
-                line = (f"{path.name} -> {out.relative_to(dst_root)}  "
+                line = (f"{path.relative_to(src_root)} -> {out.relative_to(dst_root)}  "
                         f"{_human(c.src_bytes)} -> {_human(len(c.data))} "
                         f"({len(c.data) * 100 / max(1, c.src_bytes):.0f}%)")
                 if move:
@@ -517,6 +840,12 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.stop_event.set()
+        for _gen, cancel in self.scans.values():
+            cancel.set()
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
         self._save_settings()
         self.destroy()
 
@@ -534,9 +863,7 @@ class PreviewWindow(tk.Toplevel):
         self.photo = ImageTk.PhotoImage(img)
         w, h = img.size
         self.title(f"Preview - {path.name} - {w}x{h} (1:1)")
-
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{min(w + 20, sw - 40)}x{min(h + 20, sh - 80)}+10+10")
+        _center(self, w + 20, h + 20)
 
         self.canvas = tk.Canvas(self, highlightthickness=0, background="#333")
         hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)

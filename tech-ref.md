@@ -359,6 +359,25 @@ were worse than 0.5.
   worker — e.g. the ticked categories are copied into a `set` in the UI
   thread before the worker starts ("main thread is not in main loop"
   otherwise).
+- **Folder scans** (`scan_images`): run in their own thread per pane
+  (source / target), so a huge or slow tree never blocks the window. They
+  use an explicit stack + `os.scandir`; on Windows `DirEntry.stat()` is
+  served from the directory listing, so sizes cost no extra disk access
+  (30,000 files in 300 folders: ~1.2 s incl. filling the UI). An
+  `OSError` on one folder is recorded and the scan goes on. Each scan has
+  a generation number and a cancel `Event`; results of an older scan are
+  ignored. Convert / Preview are disabled while the source is scanning.
+- **Folders view**: a `ttk.Treeview` built from the scan (folders that
+  hold images + their parents). Item id = `"/" + <path relative to the
+  source, posix>` (`"/"` is the source root; Treeview ids can't be
+  empty). Tick boxes are two small PIL-drawn images; a click on the
+  `image` element toggles, cascading to all descendants. Ticked folders
+  are kept as relative paths, so they survive a rescan and a restart.
+- **Output path**: `<target>/<source-relative dir>/[<category>/]<stem>.<ext>`
+  in both views. A target equal to or inside the source is refused
+  (otherwise outputs would be listed and converted again).
+- **Window placement**: `_center()` sizes the window (clipped to the
+  screen) and centers it; used for the main and the preview window.
 - **Don't name methods like Tk internals**: a method called `_options`
   on the `tk.Tk` subclass broke `columnconfigure` (Tk calls
   `self._options(cnf, kw)` internally).
@@ -399,7 +418,9 @@ were worse than 0.5.
   ctypes; `pFrom` must end with a double NUL. On a volume without a
   Recycle Bin Windows deletes permanently. The source is recycled only
   after its output was written successfully.
-- **Settings**: `%APPDATA%\MediaOrganizer\gui.json`.
+- **Settings**: `%APPDATA%\MediaOrganizer\gui.json`. Every Tk variable
+  has a write trace that saves 0.5 s after the last change (and on
+  close), so settings survive a crash or a killed process.
 - **Config**: the GUI loads `media-organizer.conf` with
   `require_paths=False` (it picks its own folders). Category checkboxes
   are the `image-<folder>` names; unticked / low-confidence →
