@@ -316,8 +316,17 @@ class App(tk.Tk):
         if not folder.strip() or not root.is_dir():
             return []
         exts = set(self.cfg.ext_image)
-        it = root.rglob("*") if recursive else root.iterdir()
-        return sorted(p for p in it if p.is_file() and p.suffix.lower() in exts)
+        found: List[Path] = []
+        try:
+            for p in (root.rglob("*") if recursive else root.iterdir()):
+                if p.suffix.lower() in exts and p.is_file():
+                    found.append(p)
+        except OSError as e:
+            # e.g. a failing / disconnected drive: show what was found so
+            # far instead of crashing the app.
+            self._log(f"ERROR reading {root}: {e}")
+            messagebox.showwarning("Folder read error", f"Cannot fully read:\n{root}\n\n{e}")
+        return sorted(found)
 
     def _fill(self, lb: tk.Listbox, root: Path, files: List[Path]) -> None:
         lb.delete(0, tk.END)
@@ -499,7 +508,7 @@ class App(tk.Tk):
                 done += 1
                 self.msgs.put(("log", line))
             except Exception as e:
-                self.msgs.put(("log", f"ERROR {path}: {e}"))
+                self.msgs.put(("log", f"ERROR {path}: {e} (source kept)"))
         self.msgs.put(("progress", n, n))
         summary = (f"Done: {done}/{n} converted, {_human(before)} -> {_human(after)}"
                    + (f" ({after * 100 / before:.0f}%)" if before else ""))

@@ -147,9 +147,29 @@ Double-click `media-organizer-gui.exe`.
 Per file the order is: convert in memory → detect the category on the
 small converted image (faster than on the big original) → save → recycle
 the source. The source's metadata is read **before** converting, so
-screenshot detection still works. The output keeps the EXIF data (camera,
-date, GPS), the color profile and the file's modified date. Name
-collisions get a ` (2)` suffix. Settings are remembered in
+screenshot detection still works. Name collisions get a ` (2)` suffix.
+
+**Metadata is always copied** — there is no option to turn it off. Every
+piece the target format can hold is copied:
+
+| Metadata | JPG target | PNG target |
+|---|---|---|
+| EXIF: camera, date taken, GPS location, lens, exposure, … | ✅ | ✅ |
+| XMP (e.g. iOS screenshot marker, edits, ratings) | ✅ | ✅ |
+| ICC color profile | ✅ | ✅ |
+| JPEG comment / PNG `Comment` | ✅ | ✅ |
+| IPTC (from JPEG sources) | ✅ | — (PNG has no standard place) |
+| Other PNG text chunks | — | ✅ |
+| File created / modified date | ✅ | ✅ |
+
+Orientation: the pixels are turned upright during conversion, so the
+EXIF Orientation tag is written as `1` (normal). The picture looks the
+same as the original in every viewer; keeping the old value would make
+viewers rotate it twice.
+
+After converting, the output is read back and checked. If any EXIF tag,
+the XMP or the color profile is missing, the file is **not** written, the
+source is **not** deleted, and the log shows an error. Settings are remembered in
 `%APPDATA%\MediaOrganizer\gui.json`.
 
 ## CLI flags

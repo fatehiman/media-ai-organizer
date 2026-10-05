@@ -371,9 +371,22 @@ were worse than 0.5.
   - JPEG decode uses `Image.draft` at the target size (much faster for
     big photos); the draft size is given in stored orientation, so width
     and height swap for EXIF orientations 5–8;
-  - EXIF is copied with Orientation set to 1 (pixels are already
-    rotated); ICC profile copied (iPhone HEIC is Display P3); mtime and
-    atime copied with `os.utime`;
+  - metadata is always copied (no option): EXIF incl. the Exif, GPS and
+    Interop sub-IFDs, XMP (JPEG: APP1 via `xmp=`; PNG: `iTXt`
+    `XML:com.adobe.xmp`, because Pillow's PNG writer ignores `xmp=`),
+    ICC profile (iPhone HEIC is Display P3), JPEG comment, IPTC (JPEG
+    APP13 payloads from `img.applist`, re-emitted via the JPEG `extra=`
+    bytes), PNG text chunks; the Orientation tag is written as 1 because
+    the pixels are rotated;
+  - `img.getexif()` is a cached object that `exif_transpose` reads too:
+    set Orientation 1 only while taking the bytes, then restore it, or
+    the pixels are never rotated;
+  - `_verify` re-opens the encoded bytes and compares the full set of
+    (IFD, tag) pairs plus XMP / ICC presence; on a loss it raises
+    `MetadataError` before anything is written (so the source is never
+    recycled);
+  - file times: atime / mtime with `os.utime`, creation time with
+    `GetFileTime` / `SetFileTime` (ctypes);
   - transparent images: kept as RGBA in PNG, flattened on white for JPG;
   - written to `<name>.part` then `os.replace` + fsync, so a crash never
     leaves a half file under the real name.
