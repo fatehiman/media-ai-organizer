@@ -19,14 +19,9 @@ human with a terminal.
 | Python | 3.10.x | <https://www.python.org/downloads/release/python-31011/> |
 | Git | any | <https://git-scm.com/download/win> |
 
-Optional, only if you want CUDA acceleration on an NVIDIA GPU:
-
-| Tool | Version | URL |
-|---|---|---|
-| CUDA Toolkit | 12.x | <https://developer.nvidia.com/cuda-12-4-0-download-archive> |
-| cuDNN | 9.x | <https://developer.nvidia.com/cudnn-downloads> |
-
-Without CUDA the app runs on CPU automatically — no errors, just slower.
+GPU: nothing to install. `onnxruntime-directml` uses any DirectX 12 GPU
+(Windows 10+). Without a usable GPU the app runs on CPU automatically — no
+errors, just slower.
 
 ### 1. Clone + venv
 
@@ -44,8 +39,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-`onnxruntime-gpu` is large (~1 GB). If you don't need CUDA, swap it for
-`onnxruntime` (CPU-only, ~150 MB) by editing `requirements.txt`.
+`onnxruntime-directml` and `onnxruntime-gpu` / `onnxruntime` all install
+the same `onnxruntime` module: keep only one of them in the venv
+(`pip uninstall onnxruntime-gpu onnxruntime` first if switching).
 
 ### 3. Download the models (one-time, online)
 
@@ -122,7 +118,7 @@ $env:PYTHONPATH = "src"
 powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
-Output: `dist\MediaOrganizer\` (~1.6 GB unzipped with Tesseract). Copy
+Output: `dist\MediaOrganizer\` (~1.3 GB unzipped with Tesseract). Copy
 that folder anywhere — fully portable.
 
 ---
@@ -214,20 +210,36 @@ that folder anywhere — fully portable.
 
 ## ONNX Runtime: provider selection
 
-- We use `onnxruntime-gpu` (the wheel includes CPU). Provider list is
-  built dynamically at `make_session()` time:
-  `[CUDAExecutionProvider?, DmlExecutionProvider?, CPUExecutionProvider]`.
-- **DLL probe**: before adding `CUDAExecutionProvider`, we try to
-  `ctypes.WinDLL("cudnn64_9.dll")` and `cublasLt64_12.dll`. If either
-  fails to load, CUDA is silently dropped. This avoids the noisy
-  red-text warnings ORT prints when the DLLs are missing.
+- **Package**: `onnxruntime-directml` (includes the CPU provider).
+  Provider list per `make_session()`: `[CUDA if its DLLs load, else
+  DirectML, then CPU]`. CUDA only applies if someone installs a CUDA build
+  of onnxruntime plus CUDA 12 / cuDNN 9 (`cublasLt64_12.dll`,
+  `cudnn64_9.dll`).
+- **Why DirectML, not CUDA** (measured on an RTX 4060 laptop, CLIP B/32,
+  batch 1): DirectML 7.8 ms/image, CPU 4 threads 30.6 ms, identical
+  output (cosine 1.000000). Per image the CPU still spends ~140 ms on
+  decoding and ~20 ms on YuNet, so CUDA could save at most ~5 ms more
+  (< 3 %), but needs ~1.5–2 GB of NVIDIA DLLs (cuDNN, cuBLAS) and NVIDIA
+  hardware. DirectML works on NVIDIA / AMD / Intel and made the bundle
+  ~0.7 GB smaller than `onnxruntime-gpu`.
+- **DirectML session options**: `enable_mem_pattern = False` and
+  `ORT_SEQUENTIAL` execution are required (see `_session_options`).
+- **Fallback**: if creating the GPU session raises (no DirectX 12
+  device, driver problem), `make_session` silently builds a CPU session.
+  `describe_provider()` gives the text shown to the user.
+- **What stays on the CPU**: silero-vad (thousands of tiny 32 ms windows;
+  GPU call overhead would make it slower), the CLIP text model (a few
+  dozen prompts once per run), YuNet (OpenCV DNN), image decoding.
 - **Per-process sessions**: each multiprocessing worker creates its
-  own session lazily. Sharing one session across processes is
-  impossible (CUDA contexts can't be forked safely on Windows). Multiple
-  sessions on the same GPU are fine for small models.
-- **Thread settings**: `intra_op_num_threads = 1` and
-  `inter_op_num_threads = 1`. We saturate the box with multiprocessing,
-  so ORT-internal threads would just thrash.
+  own session lazily. A DirectML CLIP session uses ~350–400 MB of GPU
+  memory, so only `gpu-workers` (auto 4) workers get the GPU: the pool
+  initializer hands out GPU slots through a shared
+  `multiprocessing.Value`; workers without a slot set their own config
+  copy to `use_gpu = "no"`. The CLI's provider check at start uses a
+  throw-away session (`make_session`, not the cached `get_session`), so
+  the main process holds no GPU memory during the run.
+- **Thread settings**: `intra_op_num_threads = cpu_count // workers`,
+  `inter_op_num_threads = 1`.
 - **Logger**: `ort.set_default_logger_severity(3)` at module load
   silences info/warnings; only errors print.
 
@@ -280,8 +292,8 @@ were worse than 0.5.
   `min(cpu_count, free_RAM / 700 MB)` (`workers._auto_workers`), because
   each worker holds its own CLIP session (~350 MB). Each worker then gets
   `cpu_count // workers` ONNX intra-op threads, so all cores stay busy.
-- **GPU note**: with CUDA, every worker creates its own CUDA session of
-  CLIP. On an 8 GB card, set `cpu-workers` to a small number (e.g. 4).
+- **GPU workers**: see "ONNX Runtime: provider selection" — only the
+  first `gpu-workers` workers use the GPU.
 - **Spawn**, not fork: Windows has no fork. The entry point must be
   guarded by `if __name__ == "__main__":` and call
   `multiprocessing.freeze_support()` for PyInstaller compatibility — we
@@ -346,7 +358,7 @@ were worse than 0.5.
   imports.
 - Both exes live in the same folder and share `_internal/` (one
   `COLLECT` with two `EXE`s in `scripts/media-organizer.spec`), so the
-  GUI adds only a few MB instead of a second ~800 MB copy.
+  GUI adds only a few MB instead of a second ~450 MB copy.
 
 ---
 
@@ -458,10 +470,10 @@ were worse than 0.5.
 - **opencv-python**: bundles ffmpeg statically for VideoCapture; we use
   `cv2.VideoCapture` for video frame extraction so we don't need an
   external ffmpeg binary at runtime.
-- **PyInstaller + onnxruntime**: needs `--collect-binaries onnxruntime`
-  and `--collect-data onnxruntime` to ship the CUDA DLLs alongside the
-  .exe. Without them, the runtime DLL probe always returns "not
-  loadable" and we silently fall back to CPU.
+- **PyInstaller + onnxruntime**: the spec collects the onnxruntime
+  dynamic libs and data, which ships `DirectML.dll` next to
+  `onnxruntime.dll`. Without it the GPU session fails and the app
+  silently runs on the CPU (the start-up line then says `CPU`).
 - **PyInstaller + librosa/numba**: needs `--collect-submodules librosa`
   and `--collect-data librosa` to include the numba JIT cache.
 
@@ -488,13 +500,13 @@ Approximate sizes:
 | Artifact | Size |
 |---|---|
 | `media-organizer.exe` + `media-organizer-gui.exe` | 18 MB each |
-| `_internal/` | ~800 MB (mostly onnxruntime CUDA DLLs; torch excluded in the spec) |
+| `_internal/` | ~450 MB (onnxruntime-directml ~40 MB; torch excluded in the spec) |
 | `models/` | ~600 MB (CLIP 580 MB) |
 | `third_party/tesseract/` | 239 MB (optional) |
-| **Total** | ~1.6 GB |
+| **Total** | ~1.3 GB |
 
-To shrink to ~150 MB, swap `onnxruntime-gpu` → `onnxruntime` in
-`requirements.txt` (loses GPU support).
+(With `onnxruntime-gpu` the folder was ~1.6 GB: ~800 MB of CUDA provider
+DLLs that did nothing without NVIDIA's CUDA / cuDNN libraries.)
 
 ---
 
@@ -523,8 +535,7 @@ More free RAM → more workers → faster.
 - ONNX Runtime providers: <https://onnxruntime.ai/docs/execution-providers/>
 - PyInstaller hooks for librosa / numba:
   <https://github.com/librosa/librosa/issues/1480>
-- CUDA 12 download: <https://developer.nvidia.com/cuda-12-4-0-download-archive>
-- cuDNN 9 download: <https://developer.nvidia.com/cudnn-downloads>
+- ONNX Runtime DirectML provider: <https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html>
 
 ---
 
@@ -538,7 +549,7 @@ More free RAM → more workers → faster.
   for an optional `audio/music/<genre>/` second axis.
 - Per-folder confidence overrides in the conf so e.g.
   `unknown-threshold-docs` can be tighter than the default.
-- Batch ONNX inference inside a dedicated GPU worker (a queue + a
-  single CUDA session) to amortize launch latency on huge runs.
+- One shared GPU inference process (a queue + a single session) so all
+  workers can use the GPU without one session each.
 - Write tags into image / video file metadata (IPTC keywords, XMP
   dc:subject) so they're searchable from Windows Explorer / Lightroom.

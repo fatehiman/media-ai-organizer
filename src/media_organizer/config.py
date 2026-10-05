@@ -57,6 +57,7 @@ class Config:
     use_gpu: str = "auto"               # auto | yes | no
     cpu_workers: int = 0                # 0 == auto
     gpu_batch_size: int = 16
+    gpu_workers: int = 0                # 0 == auto: workers that use the GPU
 
     # Extension sets (lowercase, with leading dot)
     ext_image: List[str] = field(default_factory=list)
@@ -167,6 +168,8 @@ def load(config_path: Path | str, *, require_paths: bool = True) -> Config:
         cfg.use_gpu = v.strip().lower()
     if (v := get("cpu-workers")) is not None:
         cfg.cpu_workers = 0 if v.strip().lower() == "auto" else int(v)
+    if (v := get("gpu-workers")) is not None:
+        cfg.gpu_workers = 0 if v.strip().lower() == "auto" else int(v)
     if (v := get("gpu-batch-size")) is not None:
         cfg.gpu_batch_size = int(v)
 

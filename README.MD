@@ -2,8 +2,9 @@
 
 Offline tool that scans a source folder for images, videos and audio, detects
 their content using local AI models, and **moves** them into a tidy folder
-structure under a target directory. Fully offline, GPU-accelerated when a
-CUDA GPU is present, falls back to CPU automatically.
+structure under a target directory. Fully offline, GPU-accelerated on any
+DirectX 12 GPU (NVIDIA, AMD, Intel — no CUDA install needed), falls back to
+CPU automatically.
 
 Two programs in one portable folder:
 
@@ -51,10 +52,17 @@ target/
 - **Screenshot metadata**. iOS writes `Screenshot` into the EXIF of every
   screenshot; Android names them `Screenshot_*`. Such files skip the model.
   A photo with camera EXIF (`Make`) is never called a screenshot.
-- **GPU + CPU saturation**. ONNX Runtime uses CUDA when `cudnn64_9.dll` and
-  `cublasLt64_12.dll` are findable; otherwise transparent CPU fallback.
-  Classification work is fanned out across worker processes; with
-  `cpu-workers = auto` their number is capped by free RAM (~700 MB each).
+- **GPU first, CPU fallback**. The AI model runs on the GPU through
+  DirectML (any DirectX 12 GPU; nothing extra to install). If no GPU can
+  be used, it runs on the CPU automatically. The console (CLI) and the log
+  (GUI) show `AI runs on: GPU (DirectML)` or `CPU`. On an RTX 4060 laptop
+  the model is 4× faster than on the CPU (8 ms vs 31 ms per image), and a
+  full run ~30 % faster (photo decoding stays on the CPU). Set
+  `use-gpu = no` to force the CPU.
+- **All CPU cores used**. Classification is fanned out across worker
+  processes; with `cpu-workers = auto` their number is capped by free RAM
+  (~700 MB each). Up to `gpu-workers` (auto = 4) of them use the GPU, the
+  others the CPU (each GPU worker needs ~400 MB of GPU memory).
 - **Dry-run by default**. The first pass writes a full plan with explanatory
   tags to a move log file and prompts for confirmation before any file is
   moved.
@@ -84,7 +92,7 @@ For developers building from source, see
 
 ### Run the portable .exe
 
-1. Download or build `MediaOrganizer/` (a portable folder, ~1.6 GB).
+1. Download or build `MediaOrganizer/` (a portable folder, ~1.3 GB).
 2. Edit `MediaOrganizer\media-organizer.conf`:
    ```
    source = D:\Photos\Unsorted
@@ -241,7 +249,8 @@ The most important keys:
 | `fallback-folder`                 | Folder for low-confidence images/videos (default `other`).              |
 | `collision-suffix`                | Format for the numeric suffix. Default `({n})` → ` (2)`, ` (3)`, …      |
 | `move-sidecars` / `sidecar-extensions` | Whether and which sidecar files to move with their parent.         |
-| `use-gpu`                         | `auto` / `yes` / `no`.                                                  |
+| `use-gpu`                         | `auto` / `yes` (GPU first, CPU fallback) or `no` (CPU only).            |
+| `gpu-workers`                     | CLI workers that use the GPU (`auto` = 4); the other workers use the CPU. |
 | `cpu-workers`                     | `auto` (= cores, capped by free RAM) or an integer.                     |
 | `ext-image` / `ext-video` / `ext-audio` | Which extensions count as each kind.                              |
 | `image-<folder>`                  | Comma-separated list of content types that map into `images/<folder>/`. |

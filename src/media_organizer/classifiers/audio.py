@@ -59,7 +59,9 @@ def _vad_speech_ratio(y: np.ndarray, cfg: Config) -> float:
     Uses silero-vad's stateful ONNX graph.  We pad to a multiple of window
     size and feed windows one at a time; this is fast enough on CPU.
     """
-    sess = get_session(_silero_path(), cfg.use_gpu)
+    # Always CPU: silero runs thousands of tiny 32 ms windows; GPU call
+    # overhead would make it slower, not faster.
+    sess = get_session(_silero_path(), "no")
     # silero-vad ONNX inputs: input(1xWindow), state(2x1x128), sr(int64)
     state = np.zeros((2, 1, 128), dtype=np.float32)
     sr = np.array(_TARGET_SR, dtype=np.int64)

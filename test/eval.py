@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import multiprocessing
 import sys
 import time
 from collections import Counter, defaultdict
@@ -76,8 +77,10 @@ def main() -> None:
     print(f"{len(items)} images, {n_workers} workers x {threads} threads")
     t0 = time.perf_counter()
     text = clip.compute_text_embeddings(cfg)
+    gpu_slots = multiprocessing.Value(
+        "i", 0 if cfg.use_gpu == "no" else min(n_workers, cfg.gpu_workers or 4))
     with ProcessPoolExecutor(n_workers, initializer=workers_mod._init_worker,
-                             initargs=(cfg, text, threads)) as ex:
+                             initargs=(cfg, text, threads, gpu_slots)) as ex:
         results = sorted(ex.map(_run, items, chunksize=4))
     wall = time.perf_counter() - t0
 

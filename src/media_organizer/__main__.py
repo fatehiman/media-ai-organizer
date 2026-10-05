@@ -20,7 +20,7 @@ from . import __version__
 from . import config as config_module
 from . import pipeline
 from .movelog import MoveLogWriter, read_with_confirms
-from .runtime import active_provider, app_root, get_session
+from .runtime import active_provider, app_root, describe_provider, make_session
 
 
 # --- helpers -----------------------------------------------------------------
@@ -51,15 +51,17 @@ def _confirm(prompt: str, default: bool = False) -> bool:
     return ans in ("y", "yes")
 
 
-def _check_provider() -> None:
-    """Print which ONNX execution provider is active for the image model."""
+def _check_provider(use_gpu: str) -> None:
+    """Print which ONNX execution provider the image model will use.  The
+    test session is released right away (it would hold GPU memory)."""
     from .classifiers import clip
     try:
-        sess = get_session(clip.vision_model_path(), "auto")
+        sess = make_session(clip.vision_model_path(), use_gpu)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(2)
-    print(f"Image inference provider: {active_provider(sess)}")
+    print(f"AI runs on    : {describe_provider(active_provider(sess))}")
+    del sess
 
 
 # --- main --------------------------------------------------------------------
@@ -106,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry-run       : {cfg.dry_run}")
     print(f"GPU policy    : {cfg.use_gpu}")
     print(f"CPU workers   : {cfg.cpu_workers if cfg.cpu_workers > 0 else 'auto'}")
-    _check_provider()
+    _check_provider(cfg.use_gpu)
     print("-" * 60)
 
     log_path = cfg.target / cfg.move_log

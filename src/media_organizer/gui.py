@@ -958,6 +958,9 @@ class App(tk.Tk):
         self.msgs.put(("status", "Loading AI models..."))
         runtime.set_intra_op_threads(os.cpu_count() or 4)
         clip.set_text_embeddings(clip.compute_text_embeddings(self.cfg))
+        sess = runtime.get_session(clip.vision_model_path(), self.cfg.use_gpu)
+        self.msgs.put(("log", "AI categorizing runs on: "
+                       + runtime.describe_provider(runtime.active_provider(sess))))
         self.models_ready = True
 
     def _ticked(self) -> Set[str]:

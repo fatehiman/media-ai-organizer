@@ -1,9 +1,10 @@
 # Media Organizer — runtime dependencies
 # All licenses compatible with offline redistribution.
 
-# ONNX inference (GPU + CPU). onnxruntime-gpu transparently falls back to CPU
-# when no CUDA device / DLL is available.
-onnxruntime-gpu>=1.17,<2.0
+# ONNX inference (GPU + CPU). DirectML runs on any DirectX 12 GPU (NVIDIA,
+# AMD, Intel) without a CUDA / cuDNN install; falls back to CPU when no GPU
+# can be used.  Don't install onnxruntime-gpu next to it (same module name).
+onnxruntime-directml>=1.20,<2.0
 
 # CLIP prompt tokenizer (reads models/clip/tokenizer.json)
 tokenizers>=0.15

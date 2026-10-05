@@ -11,6 +11,10 @@ We use multiprocessing because:
     each worker gets several ONNX threads to keep all cores busy.
   * The CLIP text embeddings are computed once here, in the main process,
     and handed to every worker.
+  * GPU: each worker has its own ONNX session, and a CLIP session needs
+    ~400 MB of GPU memory.  So only the first `gpu-workers` workers (auto
+    = 4) use the GPU; the others use the CPU.  Image decoding and face
+    detection run on the CPU in every worker.
 
 The dispatcher routes by media kind so each call lands in the right
 classifier.  Failures are caught and surfaced as classification results
@@ -20,6 +24,7 @@ with `error` populated (the file then routes to `unknown/`).
 from __future__ import annotations
 
 import ctypes
+import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -51,12 +56,22 @@ class Classification:
 _WORKER_CFG: Optional[Config] = None
 
 
+_AUTO_GPU_WORKERS = 4
+
+
 def _init_worker(
     cfg: Config,
     text_embeddings: Optional[Tuple[List[str], np.ndarray]],
     onnx_threads: int,
+    gpu_slots,                      # multiprocessing.Value: GPU slots left
 ) -> None:
     global _WORKER_CFG
+    with gpu_slots.get_lock():
+        use_gpu = gpu_slots.value > 0
+        if use_gpu:
+            gpu_slots.value -= 1
+    if not use_gpu:
+        cfg.use_gpu = "no"          # this process's own copy of the config
     _WORKER_CFG = cfg
     runtime.set_intra_op_threads(onnx_threads)
     if text_embeddings is not None:
@@ -157,12 +172,18 @@ def classify_all(
         if any(it.kind in ("image", "video") for it in todo):
             from .classifiers import clip
             text_embeddings = clip.compute_text_embeddings(cfg)
+        gpu = 0
+        if cfg.use_gpu != "no":
+            gpu = min(workers, cfg.gpu_workers if cfg.gpu_workers > 0
+                      else _AUTO_GPU_WORKERS)
+        gpu_slots = multiprocessing.Value("i", gpu)
         if show_progress:
-            print(f"Workers       : {workers} x {onnx_threads} ONNX thread(s)")
+            print(f"Workers       : {workers} x {onnx_threads} ONNX thread(s), "
+                  f"up to {gpu} on the GPU")
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_worker,
-            initargs=(cfg, text_embeddings, onnx_threads),
+            initargs=(cfg, text_embeddings, onnx_threads, gpu_slots),
         ) as pool:
             futures = {pool.submit(_classify_one, it): it for it in todo}
             iterator: Iterable = as_completed(futures)

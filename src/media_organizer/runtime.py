@@ -3,6 +3,11 @@ ONNX Runtime session helpers.
 
 Centralized so every classifier picks the right execution providers (GPU
 first, CPU fallback) and we don't reload models per worker.
+
+GPU: the app ships onnxruntime-directml.  DirectML runs on any DirectX 12
+GPU (NVIDIA, AMD, Intel) with no CUDA / cuDNN install.  CUDA is still used
+first when an onnxruntime build with CUDA and its DLLs are present.  If
+the GPU session can't be created, the session falls back to CPU.
 """
 
 from __future__ import annotations
@@ -21,22 +26,35 @@ except AttributeError:
     pass
 
 
-_DEFAULT_OPTS = ort.SessionOptions()
-_DEFAULT_OPTS.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-# Let ORT pick a sensible thread count; we already saturate the box with
-# multiprocessing, so over-subscription threads here would just thrash.
-_DEFAULT_OPTS.intra_op_num_threads = 1
-_DEFAULT_OPTS.inter_op_num_threads = 1
-# 3 = ERROR.  Silences the noisy CUDA-provider-not-loaded warnings that
-# trigger when onnxruntime-gpu is installed but cuDNN/CUDA are missing.
-_DEFAULT_OPTS.log_severity_level = 3
+_CPU = "CPUExecutionProvider"
+_CUDA = "CUDAExecutionProvider"
+_DML = "DmlExecutionProvider"
+
+# CPU threads per session.  We already saturate the box with
+# multiprocessing, so more threads here would just thrash.
+_INTRA_OP_THREADS = 1
 
 
 def set_intra_op_threads(n: int) -> None:
     """Threads per ONNX session in this process.  Workers call this when
     RAM limits the pool to fewer processes than CPU cores, so the cores
     are still used.  Must run before the first session is created."""
-    _DEFAULT_OPTS.intra_op_num_threads = max(1, n)
+    global _INTRA_OP_THREADS
+    _INTRA_OP_THREADS = max(1, n)
+
+
+def _session_options(directml: bool) -> ort.SessionOptions:
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.intra_op_num_threads = _INTRA_OP_THREADS
+    opts.inter_op_num_threads = 1
+    # 3 = ERROR.  Silences provider-not-loaded warnings.
+    opts.log_severity_level = 3
+    if directml:
+        # Required by the DirectML provider.
+        opts.enable_mem_pattern = False
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return opts
 
 
 def app_root() -> Path:
@@ -81,24 +99,18 @@ def _cuda_dlls_loadable() -> bool:
 def _providers_for(use_gpu: str) -> List[str]:
     """Return the ORT provider list given the user's preference.
 
-    use_gpu ∈ {'auto', 'yes', 'no'}.  'auto' tries CUDA when its DLLs are
-    loadable, falls back to CPU otherwise; 'yes' is currently identical to
-    'auto' (we don't crash); 'no' forces CPU.
+    use_gpu ∈ {'auto', 'yes', 'no'}.  'auto' / 'yes': GPU first (CUDA when
+    its DLLs are loadable, else DirectML), CPU after it; 'no' forces CPU.
     """
-    available = set(ort.get_available_providers())
-    cpu = "CPUExecutionProvider"
-    cuda = "CUDAExecutionProvider"
-    dml = "DmlExecutionProvider"   # Windows DirectML, useful on AMD/Intel GPUs
-
     if use_gpu == "no":
-        return [cpu]
-
+        return [_CPU]
+    available = set(ort.get_available_providers())
     chosen: List[str] = []
-    if cuda in available and _cuda_dlls_loadable():
-        chosen.append(cuda)
-    if dml in available and dml not in chosen:
-        chosen.append(dml)
-    chosen.append(cpu)
+    if _CUDA in available and _cuda_dlls_loadable():
+        chosen.append(_CUDA)
+    elif _DML in available:
+        chosen.append(_DML)
+    chosen.append(_CPU)
     return chosen
 
 
@@ -110,14 +122,31 @@ def make_session(model_path: Path, use_gpu: str) -> ort.InferenceSession:
             f"download it (or copy it manually into the models/ folder)."
         )
     providers = _providers_for(use_gpu)
+    if providers != [_CPU]:
+        try:
+            return ort.InferenceSession(
+                str(model_path), sess_options=_session_options(_DML in providers),
+                providers=providers,
+            )
+        except Exception:
+            pass        # no usable GPU (e.g. no DirectX 12 device): use the CPU
     return ort.InferenceSession(
-        str(model_path), sess_options=_DEFAULT_OPTS, providers=providers
+        str(model_path), sess_options=_session_options(False), providers=[_CPU]
     )
 
 
 def active_provider(session: ort.InferenceSession) -> str:
     p = session.get_providers()
     return p[0] if p else "unknown"
+
+
+def describe_provider(provider: str) -> str:
+    """Human-readable name of an execution provider."""
+    return {
+        _CUDA: "GPU (CUDA)",
+        _DML: "GPU (DirectML)",
+        _CPU: "CPU",
+    }.get(provider, provider)
 
 
 # --- per-process session cache (workers reuse one session per model) --------
