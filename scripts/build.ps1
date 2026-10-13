@@ -3,13 +3,13 @@
 # -----------------------------------------------------------------------------
 #  Produces: dist\MediaOrganizer\
 #       media-organizer.exe          (CLI entry point)
-#       media-organizer-gui.exe      (GUI: convert / resize / categorize)
+#       media-organizer-gui.exe      (GUI: Pictures + Videos convert tabs)
 #       _internal\                   (PyInstaller deps)
 #       media-organizer.conf         (default config)
 #       models\                      (ONNX models, incl. models\clip\)
 #       third_party\
 #           tesseract\               (you provide the binary + tessdata)
-#           ffmpeg\                  (you provide the binaries)
+#           ffmpeg\                  (optional, see step 5)
 #       README.MD
 #
 #  Pre-requisites:
@@ -19,8 +19,10 @@
 #       4. (Optional, only needed for ocr-boost > 0)
 #          Copy portable Tesseract  -> third_party\tesseract\tesseract.exe
 #                              + tessdata\eng.traineddata
-#       5. Copy portable ffmpeg     -> third_party\ffmpeg\bin\ffmpeg.exe
-#                                                          ffprobe.exe
+#       5. ffmpeg (GUI Videos tab): set `ffmpeg-dir` in media-organizer.conf
+#          (e.g. E:\appServices\ffmpeg\bin), or copy a full build
+#                                   -> third_party\ffmpeg\bin\ffmpeg.exe
+#                                                ffprobe.exe, ffplay.exe
 #       6. .\scripts\build.ps1
 # =============================================================================
 

@@ -83,16 +83,25 @@ Copy-Item -Recurse "C:\Program Files\Tesseract-OCR\*" "third_party\tesseract\"
 `third_party/tesseract/tesseract.exe` is then preferred over the
 system install at runtime.
 
-### 5. (Optional) ffmpeg
+### 5. ffmpeg (needed for the GUI Videos tab)
 
-Not required at runtime — OpenCV's bundled decoder handles MP4, MOV,
-AVI, MKV, WebM. Only add ffmpeg if you encounter an exotic codec cv2
-can't open.
+The CLI does not need it (OpenCV's bundled decoder handles MP4, MOV, AVI,
+MKV, WebM; ffmpeg is only a fallback for exotic codecs). The GUI
+**Videos** tab needs `ffmpeg.exe` + `ffprobe.exe` (`ffplay.exe` is
+optional, for "Test 10 s"). Use a **full** build: it must have `libx265`,
+`libx264`, `zimg` (`zscale`, HDR tone map) and `nvenc`. The 2024-12
+gyan.dev full build is tested.
+
+The app looks for it in this order:
+
+1. `ffmpeg-dir` in `media-organizer.conf` (on the dev machine:
+   `E:\appServices\ffmpeg\bin` — one shared copy, not in the repo);
+2. `third_party\ffmpeg\bin\` next to the exe (portable copy);
+3. `PATH`.
 
 ```
-Source: https://www.gyan.dev/ffmpeg/builds/   (essentials LGPL build)
-Drop into:  third_party\ffmpeg\bin\ffmpeg.exe
-            third_party\ffmpeg\bin\ffprobe.exe
+Source: https://www.gyan.dev/ffmpeg/builds/   (full build)
+Optional portable copy:  third_party\ffmpeg\bin\ffmpeg.exe, ffprobe.exe, ffplay.exe
 ```
 
 ### 6. Configure paths and run
@@ -362,11 +371,20 @@ were worse than 0.5.
 
 ---
 
-## GUI (`gui.py`, `convert.py`, `trash.py`)
+## GUI (`gui.py`, `convert.py`, `video_convert.py`, `trash.py`)
 
 - **Toolkit**: Tkinter (ships with Python, ~10 MB in the bundle).
+- **Two main tabs**: `App` (the `tk.Tk` window) holds a notebook with
+  `ImageTab` (Pictures) and `VideoTab` (Videos). Both subclass
+  `ConvertTab` (a `ttk.Frame`), which has the source tree / file list,
+  target list, log, scans and the convert loop. Subclasses fill hooks:
+  `_make_option_vars`, `_build_options`, `_sync_options`,
+  `_get_options`, `_extra`, `_describe`, `_check_ready`, `_do_preview`,
+  `_convert_one`. Each tab has its own folders, tick states, worker and
+  message queue, so a picture run and a video run can go at the same
+  time.
 - **Threading**: all work (decode, convert, CLIP, file writes) runs in
-  one worker thread; it talks to the UI only through a `queue.Queue`
+  one worker thread per tab; it talks to the UI only through a `queue.Queue`
   polled with `after(100)`. Tk variables must never be read from the
   worker — e.g. the ticked categories are copied into a `set` in the UI
   thread before the worker starts ("main thread is not in main loop"
@@ -403,8 +421,9 @@ were worse than 0.5.
 - **Window placement**: `_center()` sizes the window (clipped to the
   screen) and centers it; used for the main and the preview window.
 - **Don't name methods like Tk internals**: a method called `_options`
-  on the `tk.Tk` subclass broke `columnconfigure` (Tk calls
-  `self._options(cnf, kw)` internally).
+  on a Tk widget subclass (`tk.Tk` before, now the `ttk.Frame` tabs)
+  breaks widget creation / `columnconfigure` (Tk calls
+  `self._options(cnf, kw)` internally). The hook is `_get_options`.
 - **Models**: CLIP is loaded lazily on the first categorize / preview with
   *Auto categorize* on. ONNX gets `cpu_count` intra-op threads, because
   the GUI uses one process.
@@ -444,12 +463,98 @@ were worse than 0.5.
   after its output was written successfully.
 - **Settings**: `%APPDATA%\MediaOrganizer\gui.json`. Every Tk variable
   has a write trace that saves 0.5 s after the last change (and on
-  close), so settings survive a crash or a killed process. The view is
-  deliberately not saved.
+  close), so settings survive a crash or a killed process. The Folders /
+  Files view is deliberately not saved; the main tab is (`"media"`).
+  Picture settings stay at the top level of the JSON (compatible with
+  older versions), video settings are under `"video"`.
 - **Config**: the GUI loads `media-organizer.conf` with
   `require_paths=False` (it picks its own folders). Category checkboxes
   are the `image-<folder>` names; unticked / low-confidence →
   `fallback-folder`.
+
+---
+
+## Video converter (`video_convert.py`)
+
+Goal: smaller files for storage, **never** a visible problem. Every
+choice below is about avoiding stutter, color errors or broken frames.
+
+- **Pipeline per file**: `probe` (ffprobe JSON) → `plan` (filters and
+  encoder args) → `_encode` (ffmpeg, progress from `-progress pipe:1`,
+  killed on Stop) to `<stem>.part.mp4` → `add_location_atom` →
+  `verify` → if the output is not smaller than the source, the source is
+  copied unchanged instead → `os.replace` → file times copied. The
+  source is recycled (Move) only after this.
+- **ffmpeg processes**: `CREATE_NO_WINDOW` (the GUI exe has no console,
+  each call would flash a window) and `BELOW_NORMAL_PRIORITY_CLASS` (the
+  PC stays usable while x265 uses all cores).
+- **Decoding is always on the CPU.** Hardware *decoding*
+  (`-hwaccel cuda/d3d11va`) is the usual cause of all-blue / green
+  output from other converters (pixel format / surface mismatch). Only
+  the *encoder* can be the GPU (`hevc_nvenc` / `h264_nvenc`, preset p6,
+  `-tune hq -rc vbr -cq N -b:v 0`, spatial + temporal AQ). `gpu_available`
+  does a tiny test encode first; if NVENC fails the run uses the CPU.
+- **Size**: the short side is limited (720p = short side 720, so
+  portrait videos work the same), never enlarged, even numbers. ffmpeg's
+  autorotate turns the pixels upright and drops the rotation tag; the
+  sizes are computed on the displayed (rotated) size.
+- **Frame rate**: phones record *variable* frame rate (avg 22.5 or
+  29.7 fps, `r_frame_rate` 120 with avg 30 on Samsung). When the rate is
+  kept: `-fps_mode passthrough` **and** `-enc_time_base:v demux`. Without
+  the second flag the encoder time base is 1/r_frame_rate (1/120): two
+  close source timestamps are rounded to the same value — a duplicate
+  timestamp = a hitch (found on `20260402_221543.mp4`). When reduced:
+  the average rate is snapped to a standard rate (±3 %) and divided by a
+  whole number (60→30, 120→30, 50→25), never 30→24 (uneven drop =
+  judder).
+- **Color range**: the filter chain always has `scale=W:H:out_range=tv`
+  (also at the same size): full-range ("pc"/yuvj) sources are converted
+  to the limited range the output is tagged with. Source color tags
+  (primaries / trc / matrix) are written to the output.
+- **HDR** (trc `smpte2084` / `arib-std-b67`, e.g. iPhone HLG): HEVC keeps
+  10-bit (`yuv420p10le`, NVENC `p010le`) and the tags; Dolby Vision RPU is
+  dropped (its HLG base layer plays everywhere). H.264 tone maps to SDR:
+  `zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv`.
+  Only tested with a synthetic HLG clip (no real HDR sample yet).
+- **Quality levels** → CRF / CQ (`_CRF`): Balanced = x265 CRF 26,
+  x264 CRF 23, NVENC CQ 27. Measured on a busy 720p phone clip (VMAF vs
+  source): x265 CRF 23 = 91.8 (70 % size), 26 = 88.8 (44 %), 28 = 85.9
+  (32 %); NVENC CQ 26 = 87.8 (40 %). x265 preset medium ≈ 1.5× real
+  time for 720p on a 20-thread laptop CPU, NVENC ≈ 5×.
+- **HEVC tag**: `-tag:v hvc1` (Apple players refuse `hev1`).
+- **Audio**: the first decodable audio stream (AAC preferred; iPhone
+  spatial audio tracks ffmpeg can't decode are skipped). Copied when it
+  is AAC at ≤ 110 % of the chosen bitrate (or "Keep" and MP4-compatible),
+  else AAC at 128 / 96 kbps (160 kbps for "Keep" of a non-MP4 codec).
+- **Metadata**: `-map_metadata 0 -movflags +use_metadata_tags` writes all
+  container tags (creation_time, Samsung / Apple keys) into the MP4
+  `keys` list. But ffmpeg's MP4 muxer does **not** write the `©xyz` GPS
+  atom that Android and most tools read (only MOV mode does). So the
+  output is written **without** `+faststart` (moov is the last box) and
+  `add_location_atom` appends `©xyz` to `moov/udta`; growing the last box
+  moves no media data, so no chunk offsets change. Value: the source's
+  `location` or `com.apple.quicktime.location.ISO6709`.
+- **verify()** (raises `VideoError`, the source is kept):
+  1. output size, duration (±max(1 s, 1 %)), audio present if the source
+     had it;
+  2. every source container tag arrived with the same value (except
+     brand / encoder), `©xyz` present when the source had a location;
+  3. video packet timestamps: no duplicates; with the frame rate kept,
+     the same packet count as the source (no dropped / added frames);
+  4. full decode `ffmpeg -i out -map 0 -fps_mode passthrough
+     -enc_time_base demux -f null -`: any stderr line fails. (Without the
+     two flags the *null muxer* itself prints "non monotonically
+     increasing dts" for normal phone files — a false error.)
+  5. colors: frames at 20 / 50 / 80 % of source (through the same
+     filters, minus `fps`) and output, scaled to 32×32 RGB: mean abs
+     difference ≤ 28 and channel-mean shift ≤ 14 (of 255). Normal
+     encodes measure ~0.5–2; a blue / green frame is far above.
+- **Test 10 s**: encodes 10 s from the middle into
+  `%TEMP%\MediaOrganizer\test-<name>.mp4` (old ones deleted), logs the
+  estimated full size, and plays it with `ffplay` (any codec, no
+  Windows HEVC extension needed) or the default player.
+- **Stop**: kills ffmpeg at once (a video can take minutes), the
+  `.part.mp4` is deleted, the source is kept.
 
 ---
 

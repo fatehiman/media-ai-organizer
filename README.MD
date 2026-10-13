@@ -10,9 +10,13 @@ Two programs in one portable folder:
 
 - `media-organizer.exe` — the CLI: sorts a whole folder tree (images,
   videos, audio) as shown below.
-- `media-organizer-gui.exe` — a window to **convert / shrink images**
-  (to JPG or PNG) and optionally sort them into category folders. See
-  [GUI: convert & categorize](#gui-convert--categorize).
+- `media-organizer-gui.exe` — a window with two tabs:
+  - **Pictures**: convert / shrink images (to JPG or PNG) and optionally
+    sort them into category folders. See
+    [GUI: convert & categorize](#gui-convert--categorize).
+  - **Videos**: make phone videos much smaller (resolution, frame rate,
+    HEVC / H.264) without trimming and without stutter or color errors.
+    See [GUI: Videos tab](#gui-videos-tab).
 
 ```
 target/
@@ -114,7 +118,10 @@ again — it will offer to resume from where it stopped.
 ## GUI: convert & categorize
 
 Double-click `media-organizer-gui.exe`. The window opens in the center
-of the screen.
+of the screen. It has two main tabs on top: **Pictures** (this section)
+and **Videos** (see [GUI: Videos tab](#gui-videos-tab)). Each tab has its
+own source, target and settings; the source / target panes work the same
+in both. The app opens on the tab you used last.
 
 ```
 ┌ Source ──────────────────────────┐ ┌ Options ─────────────┐ ┌ Target ──────────────┐
@@ -222,6 +229,91 @@ the XMP or the color profile is missing, the file is **not** written, the
 source is **not** deleted, and the log shows an error. Settings are remembered in
 `%APPDATA%\MediaOrganizer\gui.json`.
 
+## GUI: Videos tab
+
+Makes videos from phones (Android, iPhone) smaller for storage. The video
+is **not trimmed**: only the resolution, frame rate and compression
+change. Formats: `.mp4 .mov .m4v .3gp .mkv .webm` (list in
+`ext-video-convert`); the output is always `.mp4`.
+
+```
+┌ Max size (short side) ──────┐   Keep / 1080p / 720p / 540p / 480p
+├ Frame rate ─────────────────┤   Keep / Max 60 / Max 30
+├ Codec ──────────────────────┤   HEVC / H.265 (smaller) / H.264 (plays everywhere)
+├ Quality ────────────────────┤   Very high / High / Balanced / Small file
+├ Encoder ────────────────────┤   CPU (safest) / GPU NVIDIA (fast), CPU speed
+├ Audio ──────────────────────┤   Keep / 128 kbps / 96 kbps
+│ [ ] Move (del source)       │
+│ [Test 10 s][Convert][Stop]  │
+└─────────────────────────────┘
+```
+
+Source pane, target pane, Folders / Files views, ticking, Scan folders
+and the mirrored folder structure work exactly like the Pictures tab:
+`<source>\2026\trip\VID_1.mov` → `<target>\2026\trip\VID_1.mp4`.
+
+Defaults (good for keeping memories, small storage bill):
+**720p, max 30 fps, HEVC, Balanced, CPU, AAC 128 kbps**. On the test
+phone videos (720p–1080p H.264, ~12–17 Mbit/s) this gives **10–45 %**
+of the original size, and the picture is hard to tell from the original.
+
+- **Max size**: limits the *short* side, so a portrait video gets the
+  same quality as a landscape one (720p = 1280×720 or 720×1280). Never
+  enlarged. Rotated phone videos are turned upright.
+- **Frame rate**: only divided by a whole number (60 → 30, 120 → 30,
+  50 → 25), so frames drop evenly — no judder. With *Keep* (or when the
+  video is already ≤ 30 fps) every frame keeps its own timestamp: phone
+  videos have a variable frame rate, and forcing a fixed rate is a
+  common cause of stutter.
+- **Codec**: HEVC files are ~40 % smaller than H.264 at the same
+  quality. Every phone since ~2017, Mac, VLC and Android play them;
+  the Windows "Media Player" app needs the HEVC extension from the
+  Microsoft Store (VLC does not). Choose H.264 if old devices must play
+  the files.
+- **Quality**: the CRF value (lower = better, bigger) is shown under the
+  buttons. *Balanced* is hard to tell from the source on a phone or TV;
+  use *High* for very important videos, *Small file* to save more.
+- **Encoder**: *CPU* is the default: best quality per MB, and the
+  safest. *GPU NVIDIA* (NVENC) is ~3–4× faster but the files are a bit
+  bigger. Video is always **decoded on the CPU** — GPU decoding is the
+  usual cause of the "all blue" videos some converters make. If the GPU
+  encoder is not available, the CPU is used. *CPU speed* `slow` makes
+  files a bit smaller and takes ~2× the time.
+- **Audio**: AAC. If the source audio is already AAC at the chosen
+  bitrate or lower, it is copied unchanged.
+- **HDR** (e.g. iPhone): kept as 10-bit HDR with HEVC; with H.264 it is
+  converted to normal (SDR) colors.
+- **Test 10 s**: converts 10 seconds from the middle of the selected
+  video (Files view) or the first video of the highlighted folder, plays
+  it (with `ffplay`), and writes to the log the size the whole video
+  would have.
+- **Stop** stops at once; the half-done file is deleted and the source
+  is kept.
+- **Move (del source)**: the source goes to the Recycle Bin only after
+  its output passed all checks (see below).
+- **Metadata is kept**: creation date, GPS location (also in the `©xyz`
+  atom that Android galleries read), Samsung / Apple tags, and the file
+  created / modified dates.
+
+**Every output is checked before it is saved.** If one check fails, no
+file is written and the source is kept (the log shows why):
+
+| Check | Catches |
+|---|---|
+| Size, duration, audio present | broken or cut output |
+| No two frames with the same time; same frame count as the source (frame rate kept) | stutter / lag, lost frames |
+| The whole file decodes without one error | corrupt frames, lines / blocks |
+| 3 frames compared with the source (colors) | blue / green / wrong-color video |
+| All source tags arrived, GPS atom present | lost date or location |
+
+If the converted file is **not smaller** than the source (already small
+videos), the source is copied unchanged instead.
+
+ffmpeg is needed for this tab. The app uses the folder in `ffmpeg-dir`
+(`media-organizer.conf`), then `third_party\ffmpeg\bin\` next to the
+exe, then `PATH`. Use a *full* build from
+<https://www.gyan.dev/ffmpeg/builds/>.
+
 ## CLI flags
 
 These apply to `media-organizer.exe` only.
@@ -253,6 +345,8 @@ The most important keys:
 | `gpu-workers`                     | CLI workers that use the GPU (`auto` = 4); the other workers use the CPU. |
 | `cpu-workers`                     | `auto` (= cores, capped by free RAM) or an integer.                     |
 | `ext-image` / `ext-video` / `ext-audio` | Which extensions count as each kind.                              |
+| `ffmpeg-dir`                      | GUI Videos tab: folder with `ffmpeg.exe` / `ffprobe.exe` / `ffplay.exe`. |
+| `ext-video-convert`               | GUI Videos tab: extensions it lists and converts.                       |
 | `image-<folder>`                  | Comma-separated list of content types that map into `images/<folder>/`. |
 | `video-<folder>`                  | Same for video.                                                         |
 | `rhythm-<band>`                   | `lo-hi` BPM range; defines `audio/music/<band>/`.                       |

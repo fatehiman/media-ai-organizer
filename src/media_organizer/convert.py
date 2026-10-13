@@ -297,6 +297,11 @@ def write_output(dst: Path, data: bytes, source: Path) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, dst)
+    copy_file_times(source, dst)
+
+
+def copy_file_times(source: Path, dst: Path) -> None:
+    """Give dst the created / accessed / modified times of source."""
     st = source.stat()
     os.utime(dst, (st.st_atime, st.st_mtime))
     _copy_creation_time(source, dst)

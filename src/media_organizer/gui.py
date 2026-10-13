@@ -1,17 +1,23 @@
 """
-Media Organizer GUI (Tkinter): convert / resize images, optionally
-auto-categorize them with the same CLIP pipeline as the CLI, and optionally
-send each source to the Recycle Bin.
+Media Organizer GUI (Tkinter), two main tabs:
 
-Layout:   [ Source: Folders | Files tabs ] [ options + buttons ] [ Target file list ]
-          [ log ........................................................................ ]
+  Pictures  convert / resize images, optionally auto-categorize them with
+            the same CLIP pipeline as the CLI.
+  Videos    make phone videos smaller with ffmpeg (resolution, frame rate,
+            codec, quality); see video_convert.py.
+
+Both tabs share one layout (ConvertTab) and keep their own folders and
+settings:
+
+    [ Source: Folders | Files tabs ] [ options + buttons ] [ Target file list ]
+    [ log ........................................................................ ]
 
 Disk IO is kept low, because the GUI is used for mass conversion of big
-(often USB / HDD) photo trees:
+(often USB / HDD) photo and video trees:
   * Folders mode (the default at start) shows folders only.  At start only
     the top-level folder list of the source is read; a folder's subfolders
     are read when it is expanded.  "Scan folders" reads the whole tree once
-    to show image counts and sizes.  Convert reads only the ticked folders.
+    to show file counts and sizes.  Convert reads only the ticked folders.
   * Files mode reads files only when its tab is opened.
   * The target list is read only on "Refresh" (and after a Files-mode run).
 All scans run in background threads (os.scandir: on Windows file sizes come
@@ -20,11 +26,14 @@ with the directory listing), so big trees don't freeze the window.
 The source folder structure is mirrored in the target:
     <source>/2023/holidays/x.heic -> <target>/2023/holidays/x.jpg
     with auto categorize:         -> <target>/2023/holidays/<category>/x.jpg
+    <source>/2023/holidays/v.mov  -> <target>/2023/holidays/v.mp4
 
 Per file (one at a time, in a worker thread):
-    convert in memory -> categorize the small converted image (using the
-    source file's metadata) -> write the output -> send the source to the
-    Recycle Bin (if "Move (del source)" is ticked).
+    Pictures: convert in memory -> categorize the small converted image
+              (using the source file's metadata) -> write the output
+    Videos:   encode to a temp file -> verify it -> rename
+    then send the source to the Recycle Bin (if "Move (del source)" is
+    ticked).
 """
 
 from __future__ import annotations
@@ -33,11 +42,12 @@ import io
 import json
 import os
 import queue
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageDraw, ImageTk
 
@@ -45,18 +55,19 @@ from . import __version__
 from . import config as config_module
 from . import convert as conv
 from . import runtime
+from . import video_convert as vc
 from .trash import send_to_recycle_bin
 
 
 _PAD = 6
-_WIN_W, _WIN_H = 1280, 760
+_WIN_W, _WIN_H = 1280, 800
 _FOLDERS_TAB, _FILES_TAB = 0, 1
 _DUMMY = "|dummy"             # placeholder child: "not loaded yet" (| is not
                                # allowed in Windows file names)
 
-# One scanned image: (absolute path, size in bytes).
+# One scanned file: (absolute path, size in bytes).
 ScanEntry = Tuple[Path, int]
-Progress = Callable[[int, int], None]     # (folders read, images found)
+Progress = Callable[[int, int], None]     # (folders read, files found)
 
 
 def _human(n: float) -> str:
@@ -104,7 +115,7 @@ def _walk(
     recursive: bool = True,
     want_dir: Callable[[str], bool] = lambda key: True,
     on_dir: Callable[[str], None] = lambda key: None,
-    on_image: Callable[[str, Path, int], None] = lambda key, p, size: None,
+    on_file: Callable[[str, Path, int], None] = lambda key, p, size: None,
 ) -> List[str]:
     """Walk the folder tree under root with os.scandir.  Folder keys are
     paths relative to root ("" = root, "/" separated).  `want_dir(key)`
@@ -113,7 +124,7 @@ def _walk(
     (or crash) the walk."""
     errors: List[str] = []
     stack = [""]
-    n_dirs = n_images = 0
+    n_dirs = n_files = 0
     while stack and not cancel.is_set():
         key = stack.pop()
         if not want_dir(key):
@@ -129,15 +140,15 @@ def _walk(
                             if recursive:
                                 stack.append(_join(key, entry.name))
                         elif os.path.splitext(entry.name)[1].lower() in exts:
-                            on_image(key, Path(entry.path), entry.stat().st_size)
-                            n_images += 1
+                            on_file(key, Path(entry.path), entry.stat().st_size)
+                            n_files += 1
                     except OSError as e:
                         errors.append(f"{entry.path}: {e}")
         except OSError as e:
             errors.append(f"{folder}: {e}")
         if n_dirs % 20 == 0:
-            progress(n_dirs, n_images)
-    progress(n_dirs, n_images)
+            progress(n_dirs, n_files)
+    progress(n_dirs, n_files)
     return errors
 
 
@@ -154,10 +165,12 @@ def _checkbox_images() -> Tuple[ImageTk.PhotoImage, ImageTk.PhotoImage]:
 
 
 class App(tk.Tk):
+    """Main window: a Pictures and a Videos tab.  Owns the settings file."""
+
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"Media Organizer {__version__} - Convert & Categorize")
-        self.minsize(1000, 600)
+        self.title(f"Media Organizer {__version__} - Convert")
+        self.minsize(1000, 640)
         _center(self, _WIN_W, _WIN_H)
 
         try:
@@ -165,15 +178,91 @@ class App(tk.Tk):
         except (FileNotFoundError, ValueError) as e:
             messagebox.showerror("Config error", str(e))
             raise SystemExit(2)
-        self.categories: List[str] = list(self.cfg.image_folders)
-        self.exts: Set[str] = set(self.cfg.ext_image)
+        try:
+            data = json.loads(_settings_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        self._save_job: Optional[str] = None
+        self.box_off, self.box_on = _checkbox_images()
+
+        self.main_tabs = ttk.Notebook(self)
+        self.main_tabs.pack(fill="both", expand=True)
+        # Picture settings stay at the top level of gui.json (older versions
+        # had only pictures); video settings are under "video".
+        self.pictures = ImageTab(self.main_tabs, self, data)
+        self.videos = VideoTab(self.main_tabs, self, data.get("video", {}))
+        self.main_tabs.add(self.pictures, text="  Pictures  ")
+        self.main_tabs.add(self.videos, text="  Videos  ")
+        if data.get("media") == "videos":
+            self.main_tabs.select(self.videos)
+        self.main_tabs.bind("<<NotebookTabChanged>>", self.schedule_save)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    @property
+    def tabs_list(self) -> List["ConvertTab"]:
+        return [self.pictures, self.videos]
+
+    def _save_settings(self) -> None:
+        self._save_job = None
+        data = self.pictures.settings()
+        data["video"] = self.videos.settings()
+        try:
+            current = self.main_tabs.index(self.main_tabs.select())
+        except tk.TclError:
+            current = 0
+        data["media"] = "videos" if current == 1 else "pictures"
+        try:
+            p = _settings_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def schedule_save(self, *_args) -> None:
+        """Save shortly after any change (so settings survive a crash or a
+        killed process, not only a normal close)."""
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(500, self._save_settings)
+
+    def save_now(self) -> None:
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_settings()
+
+    def _on_close(self) -> None:
+        for tab in self.tabs_list:
+            tab.shutdown()
+        for tab in self.tabs_list:
+            # Give a running ffmpeg time to be killed and its temp file removed.
+            if tab.worker is not None and tab.worker.is_alive():
+                tab.worker.join(5)
+        self.save_now()
+        self.destroy()
+
+
+class ConvertTab(ttk.Frame):
+    """Source tree / file list, options, target list and log for one media
+    kind.  Subclasses add the options and the per-file work."""
+
+    NOUN = "files"                # "images" / "videos", used in labels
+    PREVIEW_TEXT = "Preview"
+
+    def __init__(self, master: tk.Misc, app: App, data: Dict[str, Any],
+                 exts: Set[str]) -> None:
+        super().__init__(master)
+        self.app = app
+        self.cfg = app.cfg
+        self.exts = exts
+        self.box_off, self.box_on = app.box_off, app.box_on
 
         self.src_root: Optional[Path] = None     # source folder of the tree
         # Folders mode.  Tick state: explicit entries; a folder without one
         # follows its nearest ancestor that has one (default: not ticked).
         self.states: Dict[str, bool] = {}
         self.states_src = ""                     # source folder the states belong to
-        self.folder_stats: Dict[str, Tuple[int, int]] = {}   # key -> (images, bytes) direct
+        self.folder_stats: Dict[str, Tuple[int, int]] = {}   # key -> (files, bytes) direct
         self.stats_valid = False
         self._totals: Dict[str, Tuple[int, int]] = {}         # key -> incl. subfolders
         self._scan_errors: List[str] = []
@@ -190,19 +279,49 @@ class App(tk.Tk):
         self.msgs: "queue.Queue[tuple]" = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
-        self.models_ready = False
-        self._save_job: Optional[str] = None
         self._poll_job: Optional[str] = None
 
         self._make_vars()
-        self._load_settings()
-        self.box_off, self.box_on = _checkbox_images()
+        self._load_settings(data)
         self._build()
         self._watch_vars()
         self._sync_states()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_job = self.after(100, self._poll)
         self.after(150, self._load_source)
+
+    # --- hooks for subclasses ---------------------------------------------------
+
+    def _make_option_vars(self) -> Dict[str, tk.Variable]:
+        """Option variables saved in the settings, by settings key."""
+        return {}
+
+    def _build_options(self, c: ttk.Frame) -> None:
+        """Option widgets of the center pane (above the buttons)."""
+
+    def _sync_options(self) -> None:
+        """Enable / disable option widgets."""
+
+    def _get_options(self) -> Any:
+        raise NotImplementedError
+
+    def _extra(self) -> Any:
+        """More input for the worker, read in the UI thread."""
+        return None
+
+    def _describe(self, opts: Any, extra: Any) -> str:
+        return ""
+
+    def _check_ready(self) -> bool:
+        """Last check before Preview / Convert (may show a message)."""
+        return True
+
+    def _do_preview(self, path: Path, opts: Any, extra: Any) -> None:
+        raise NotImplementedError
+
+    def _convert_one(self, path: Path, i: int, n: int, src_root: Path,
+                     dst_root: Path, opts: Any, extra: Any) -> Tuple[int, int, str]:
+        """Convert one file; returns (source bytes, output bytes, log line)."""
+        raise NotImplementedError
 
     # --- settings ------------------------------------------------------------
 
@@ -210,94 +329,49 @@ class App(tk.Tk):
         self.v_src = tk.StringVar()
         self.v_dst = tk.StringVar()
         self.v_subfolders = tk.BooleanVar(value=False)
-        self.v_resize = tk.StringVar(value="percent")
-        self.v_percent = tk.IntVar(value=50)
-        self.v_width = tk.IntVar(value=1920)
-        self.v_height = tk.IntVar(value=1920)
-        self.v_fmt = tk.StringVar(value="jpg")
-        self.v_quality = tk.IntVar(value=85)
         self.v_move = tk.BooleanVar(value=False)
-        self.v_auto = tk.BooleanVar(value=False)
-        self.v_cats: Dict[str, tk.BooleanVar] = {
-            c: tk.BooleanVar(value=True) for c in self.categories
-        }
         self.v_status = tk.StringVar(value="Ready.")
+        self.option_vars = self._make_option_vars()
 
     def _simple_vars(self) -> Dict[str, tk.Variable]:
-        return {
-            "src": self.v_src, "dst": self.v_dst, "subfolders": self.v_subfolders,
-            "resize": self.v_resize, "percent": self.v_percent,
-            "width": self.v_width, "height": self.v_height, "fmt": self.v_fmt,
-            "quality": self.v_quality, "move": self.v_move, "auto": self.v_auto,
-        }
+        return {"src": self.v_src, "dst": self.v_dst, "subfolders": self.v_subfolders,
+                "move": self.v_move, **self.option_vars}
 
-    def _load_settings(self) -> None:
-        try:
-            data = json.loads(_settings_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
+    def _load_settings(self, data: Dict[str, Any]) -> None:
         for key, var in self._simple_vars().items():
             if key in data:
                 try:
                     var.set(data[key])
                 except tk.TclError:
                     pass
-        for c, on in data.get("categories", {}).items():
-            if c in self.v_cats:
-                self.v_cats[c].set(bool(on))
         self.states = {k: bool(v) for k, v in data.get("folder_states", {}).items()}
         self.states_src = data.get("folder_states_source", "")
         # The view (Folders / Files) is not remembered: start in Folders mode.
 
-    def _save_settings(self) -> None:
-        self._save_job = None
-        data = {}
+    def settings(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
         for key, var in self._simple_vars().items():
             try:
                 data[key] = var.get()
             except tk.TclError:          # e.g. a half-typed spinbox value
                 pass
-        data["categories"] = {c: v.get() for c, v in self.v_cats.items()}
         data["folder_states"] = dict(sorted(self.states.items()))
         data["folder_states_source"] = self.states_src
-        try:
-            p = _settings_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        return data
 
     def _schedule_save(self, *_args) -> None:
-        """Save shortly after any change (so settings survive a crash or a
-        killed process, not only a normal close)."""
-        if self._save_job is not None:
-            self.after_cancel(self._save_job)
-        self._save_job = self.after(500, self._save_settings)
+        self.app.schedule_save()
 
     def _watch_vars(self) -> None:
-        for var in list(self._simple_vars().values()) + list(self.v_cats.values()):
+        for var in self._simple_vars().values():
             var.trace_add("write", self._schedule_save)
 
     @staticmethod
-    def _int(var: tk.IntVar, default: int) -> int:
+    def _int(var: tk.Variable, default: int) -> int:
         try:
             return int(var.get())
         except (tk.TclError, ValueError):
             return default
-
-    def _convert_options(self) -> conv.ConvertOptions:
-        mode = self.v_resize.get()
-        value = {
-            "percent": self._int(self.v_percent, 100),
-            "width": self._int(self.v_width, 1920),
-            "height": self._int(self.v_height, 1920),
-        }.get(mode, 100)
-        return conv.ConvertOptions(
-            resize_mode=mode,
-            resize_value=max(1, value),
-            fmt=self.v_fmt.get(),
-            quality=min(100, max(1, self._int(self.v_quality, 85))),
-        )
 
     # --- layout ----------------------------------------------------------------
 
@@ -355,12 +429,12 @@ class App(tk.Tk):
                    command=lambda: self._set_checked("", True)).pack(side="left", padx=4)
         ttk.Button(bar, text="Uncheck all", width=11,
                    command=self._uncheck_all).pack(side="left")
-        self.tree = ttk.Treeview(dt, columns=("images", "size"), selectmode="browse")
+        self.tree = ttk.Treeview(dt, columns=("count", "size"), selectmode="browse")
         self.tree.heading("#0", text="Folder")
-        self.tree.heading("images", text="Images")
+        self.tree.heading("count", text=self.NOUN.title())
         self.tree.heading("size", text="Size")
         self.tree.column("#0", width=230, stretch=True)
-        self.tree.column("images", width=70, anchor="e", stretch=False)
+        self.tree.column("count", width=70, anchor="e", stretch=False)
         self.tree.column("size", width=80, anchor="e", stretch=False)
         tsb = ttk.Scrollbar(dt, command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
@@ -419,68 +493,24 @@ class App(tk.Tk):
     def _center_pane(self, col: int) -> None:
         c = ttk.Frame(self)
         c.grid(row=0, column=col, sticky="ns", pady=_PAD)
-
-        rs = ttk.LabelFrame(c, text="Resize (aspect ratio kept, never enlarged)")
-        rs.pack(fill="x", pady=(0, _PAD))
-        ttk.Radiobutton(rs, text="Keep size", value="none", variable=self.v_resize,
-                        command=self._sync_states).grid(row=0, column=0, sticky="w")
-        self.spins = {}
-        for row, (mode, label, var, hi, unit) in enumerate([
-            ("percent", "Percent", self.v_percent, 100, "%"),
-            ("width", "Width", self.v_width, 20000, "px"),
-            ("height", "Height", self.v_height, 20000, "px"),
-        ], start=1):
-            ttk.Radiobutton(rs, text=label, value=mode, variable=self.v_resize,
-                            command=self._sync_states).grid(row=row, column=0, sticky="w")
-            sp = ttk.Spinbox(rs, from_=1, to=hi, textvariable=var, width=7)
-            sp.grid(row=row, column=1, padx=4, pady=1)
-            ttk.Label(rs, text=unit).grid(row=row, column=2, sticky="w")
-            self.spins[mode] = sp
-
-        fm = ttk.LabelFrame(c, text="Target format")
-        fm.pack(fill="x", pady=(0, _PAD))
-        ttk.Radiobutton(fm, text="JPG", value="jpg", variable=self.v_fmt,
-                        command=self._sync_states).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(fm, text="PNG", value="png", variable=self.v_fmt,
-                        command=self._sync_states).grid(row=0, column=1, sticky="w")
-        ttk.Label(fm, text="JPG quality").grid(row=1, column=0, sticky="w")
-        self.q_label = ttk.Label(fm, width=4)
-        self.q_label.grid(row=1, column=1, sticky="e")
-        self.q_scale = ttk.Scale(fm, from_=1, to=100, orient="horizontal",
-                                 command=self._on_quality)
-        self.q_scale.set(self.v_quality.get())
-        self.q_scale.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2)
-        fm.columnconfigure(1, weight=1)
+        self._build_options(c)
 
         ttk.Checkbutton(c, text="Move (del source)", variable=self.v_move).pack(
             anchor="w", pady=(0, _PAD))
 
-        ac = ttk.LabelFrame(c, text="Categories")
-        ac.pack(fill="x", pady=(0, _PAD))
-        ttk.Checkbutton(ac, text="Auto categorize", variable=self.v_auto,
-                        command=self._sync_states).pack(anchor="w")
-        self.cat_checks = []
-        for cat in self.categories:
-            cb = ttk.Checkbutton(ac, text=cat, variable=self.v_cats[cat])
-            cb.pack(anchor="w", padx=(18, 0))
-            self.cat_checks.append(cb)
-        ttk.Label(ac, text=f"unticked -> {self.cfg.fallback_folder}",
-                  foreground="gray").pack(anchor="w", padx=(18, 0))
-
-        self.btn_preview = ttk.Button(c, text="Preview", command=self._preview)
-        self.btn_preview.pack(fill="x", pady=2)
-        self.btn_convert = ttk.Button(c, text="Convert", command=self._convert)
-        self.btn_convert.pack(fill="x", pady=2)
-        self.btn_stop = ttk.Button(c, text="Stop", command=self.stop_event.set)
-        self.btn_stop.pack(fill="x", pady=(2, _PAD))
+        btns = ttk.Frame(c)
+        btns.pack(fill="x", pady=2)
+        btns.columnconfigure((0, 1, 2), weight=1, uniform="b")
+        self.btn_preview = ttk.Button(btns, text=self.PREVIEW_TEXT, command=self._preview)
+        self.btn_preview.grid(row=0, column=0, sticky="ew")
+        self.btn_convert = ttk.Button(btns, text="Convert", command=self._convert)
+        self.btn_convert.grid(row=0, column=1, sticky="ew", padx=2)
+        self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop_event.set)
+        self.btn_stop.grid(row=0, column=2, sticky="ew")
 
         self.progress = ttk.Progressbar(c, mode="determinate")
-        self.progress.pack(fill="x")
-        ttk.Label(c, textvariable=self.v_status, wraplength=230).pack(fill="x")
-
-    def _on_quality(self, value: str) -> None:
-        self.v_quality.set(int(float(value)))
-        self.q_label.configure(text=str(self.v_quality.get()))
+        self.progress.pack(fill="x", pady=(_PAD, 0))
+        ttk.Label(c, textvariable=self.v_status, wraplength=250).pack(fill="x")
 
     def _tab(self) -> int:
         try:
@@ -489,12 +519,7 @@ class App(tk.Tk):
             return _FOLDERS_TAB
 
     def _sync_states(self) -> None:
-        for mode, sp in self.spins.items():
-            sp.configure(state="normal" if self.v_resize.get() == mode else "disabled")
-        self.q_scale.configure(state="normal" if self.v_fmt.get() == "jpg" else "disabled")
-        self.q_label.configure(text=str(self.v_quality.get()))
-        for cb in self.cat_checks:
-            cb.configure(state="normal" if self.v_auto.get() else "disabled")
+        self._sync_options()
         busy = self.worker is not None and self.worker.is_alive()
         scanning = "src" in self.scans
         state = "disabled" if busy or scanning else "normal"
@@ -565,7 +590,7 @@ class App(tk.Tk):
         self._start_scan(
             "dst",
             lambda cancel, prog: _walk(root, self.exts, cancel, prog,
-                                       on_image=lambda k, p, s: entries.append((p, s))),
+                                       on_file=lambda k, p, s: entries.append((p, s))),
             lambda errors: self._dst_done(root, entries, errors))
 
     def _dst_done(self, root: Path, entries: List[ScanEntry], errors: List[str]) -> None:
@@ -604,9 +629,9 @@ class App(tk.Tk):
         bar.start(12)
         self._sync_states()
 
-        def progress(n_dirs: int, n_images: int) -> None:
+        def progress(n_dirs: int, n_files: int) -> None:
             self.msgs.put(("scan_progress", pane, gen,
-                           f"Scanning... {n_images:,} images in {n_dirs:,} folders"))
+                           f"Scanning... {n_files:,} {self.NOUN} in {n_dirs:,} folders"))
 
         def run() -> None:
             errors = work(cancel, progress)
@@ -624,9 +649,8 @@ class App(tk.Tk):
         done(errors)
         self._sync_states()
 
-    @staticmethod
-    def _summary(n: int, size: int, errors: List[str]) -> str:
-        text = f"{n:,} images, {_human(size)}"
+    def _summary(self, n: int, size: int, errors: List[str]) -> str:
+        text = f"{n:,} {self.NOUN}, {_human(size)}"
         if errors:
             text += f"  ({len(errors)} read errors, see log)"
         return text
@@ -731,7 +755,7 @@ class App(tk.Tk):
         return "break"
 
     def _scan_folders(self) -> None:
-        """Read the whole tree once: image count + size per folder."""
+        """Read the whole tree once: file count + size per folder."""
         root = self.src_root
         if root is None:
             messagebox.showinfo("Scan folders", "Choose a source folder first.")
@@ -739,7 +763,7 @@ class App(tk.Tk):
         stats: Dict[str, List[int]] = {}
         dirs: List[str] = []
 
-        def on_image(key: str, _p: Path, size: int) -> None:
+        def on_file(key: str, _p: Path, size: int) -> None:
             s = stats.setdefault(key, [0, 0])
             s[0] += 1
             s[1] += size
@@ -747,7 +771,7 @@ class App(tk.Tk):
         self._start_scan(
             "src",
             lambda cancel, prog: _walk(root, self.exts, cancel, prog,
-                                       on_dir=dirs.append, on_image=on_image),
+                                       on_dir=dirs.append, on_file=on_file),
             lambda errors: self._folders_scanned(root, dirs, stats, errors))
 
     def _folders_scanned(self, root: Path, dirs: List[str],
@@ -822,7 +846,7 @@ class App(tk.Tk):
         self._start_scan(
             "src",
             lambda cancel, prog: _walk(root, self.exts, cancel, prog, recursive=recursive,
-                                       on_image=lambda k, p, s: entries.append((p, s))),
+                                       on_file=lambda k, p, s: entries.append((p, s))),
             lambda errors: self._files_scanned(root, recursive, entries, errors))
 
     def _files_scanned(self, root: Path, recursive: bool, entries: List[ScanEntry],
@@ -845,6 +869,8 @@ class App(tk.Tk):
     def _update_info(self) -> None:
         if "src" in self.scans:
             return                       # the scan shows its own progress
+        if self.worker is not None and self.worker.is_alive():
+            return                       # the run shows its own status
         if self.src_root is None:
             self.v_status.set("Ready.")
             return
@@ -856,12 +882,12 @@ class App(tk.Tk):
                     if self._included(key):
                         n_t += n
                         size_t += size
-                text = (f"Total: {n_all:,} images, {_human(size_all)}   |   "
-                        f"Ticked: {n_t:,} images, {_human(size_t)}")
+                text = (f"Total: {n_all:,} {self.NOUN}, {_human(size_all)}   |   "
+                        f"Ticked: {n_t:,} {self.NOUN}, {_human(size_t)}")
                 if self._scan_errors:
                     text += f"  ({len(self._scan_errors)} read errors, see log)"
             else:
-                text = "Press 'Scan folders' to count images (not done "
+                text = f"Press 'Scan folders' to count {self.NOUN} (not done "
                 text += "automatically, to save disk access)."
             self.src_info.configure(text=text)
             ticked = sum(1 for v in self.states.values() if v)
@@ -909,8 +935,8 @@ class App(tk.Tk):
                 elif kind == "scan_done":
                     if self._current_scan(msg[1], msg[2]):
                         self._scan_finished(msg[1], msg[3], msg[4])
-                elif kind == "preview":
-                    PreviewWindow(self, *msg[1:])
+                elif kind == "call":
+                    msg[1](*msg[2:])
                 elif kind == "done":
                     self.worker = None
                     self._after_run(msg[1])
@@ -934,7 +960,7 @@ class App(tk.Tk):
     # --- work ------------------------------------------------------------------
 
     def _start(self, target, *args, mode: Optional[str]) -> None:
-        self._save_settings()
+        self.app.save_now()
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._guard,
                                        args=(target, mode, *args), daemon=True)
@@ -944,45 +970,16 @@ class App(tk.Tk):
     def _guard(self, target, mode: Optional[str], *args) -> None:
         try:
             target(*args)
+        except vc.Cancelled:
+            self.msgs.put(("log", "Stopped by user."))
+            self.msgs.put(("status", "Stopped."))
         except Exception as e:      # never leave the UI stuck in "busy"
             self.msgs.put(("log", f"ERROR: {e}"))
             self.msgs.put(("status", f"Error: {e}"))
         finally:
             self.msgs.put(("done", mode))
 
-    def _ensure_models(self) -> None:
-        """Load CLIP once, in the worker thread (takes a few seconds)."""
-        if self.models_ready:
-            return
-        from .classifiers import clip
-        self.msgs.put(("status", "Loading AI models..."))
-        runtime.set_intra_op_threads(os.cpu_count() or 4)
-        clip.set_text_embeddings(clip.compute_text_embeddings(self.cfg))
-        sess = runtime.get_session(clip.vision_model_path(), self.cfg.use_gpu)
-        self.msgs.put(("log", "AI categorizing runs on: "
-                       + runtime.describe_provider(runtime.active_provider(sess))))
-        self.models_ready = True
-
-    def _ticked(self) -> Set[str]:
-        """Ticked categories, read in the UI thread (Tk variables must not be
-        touched from the worker thread)."""
-        return {c for c, v in self.v_cats.items() if v.get()}
-
-    def _categorize(self, path: Path, c: conv.Converted, ticked: Set[str]):
-        """Return (folder, ImageResult) for a converted image."""
-        from .classifiers import image as image_clf
-        self._ensure_models()
-        img = c.image if c.image.mode == "RGB" else c.image.convert("RGB")
-        if max(img.size) > 1024:
-            img = img.copy()
-            img.thumbnail((1024, 1024), Image.BILINEAR)
-        r = image_clf.classify_loaded(path, img, c.meta, self.cfg)
-        folder = r.folder
-        if r.error or folder not in ticked:
-            folder = self.cfg.fallback_folder
-        return folder, r
-
-    def _first_image(self, key: str) -> Optional[Path]:
+    def _first_file(self, key: str) -> Optional[Path]:
         assert self.src_root is not None
         folder = self.src_root / key if key else self.src_root
         try:
@@ -995,38 +992,27 @@ class App(tk.Tk):
         return folder / names[0] if names else None
 
     def _preview(self) -> None:
+        title = self.PREVIEW_TEXT
         if self.src_root is None:
-            messagebox.showinfo("Preview", "Choose a source folder first.")
+            messagebox.showinfo(title, "Choose a source folder first.")
             return
         if self._tab() == _FOLDERS_TAB:
             iid = self.tree.focus()
-            path = self._first_image(iid[1:]) if iid else None
+            path = self._first_file(iid[1:]) if iid else None
             if path is None:
-                messagebox.showinfo("Preview", "Click a folder that directly contains "
-                                               "images (its first image is previewed), "
-                                               "or use the Files tab.")
+                messagebox.showinfo(title, f"Click a folder that directly contains "
+                                           f"{self.NOUN} (its first file is used), "
+                                           f"or use the Files tab.")
                 return
         else:
             sel = self.src_list.curselection()
             if not sel:
-                messagebox.showinfo("Preview", "Select an image in the Files list first.")
+                messagebox.showinfo(title, "Select a file in the Files list first.")
                 return
             path = self.src_files[sel[0]]
-        ticked = self._ticked() if self.v_auto.get() else None
-        self._start(self._do_preview, path, self._convert_options(), ticked, mode=None)
-
-    def _do_preview(self, path: Path, opts: conv.ConvertOptions,
-                    ticked: Optional[Set[str]]) -> None:
-        self.msgs.put(("status", f"Converting {path.name}..."))
-        c = conv.convert(path, opts)
-        category = None
-        if ticked is not None:
-            folder, r = self._categorize(path, c, ticked)
-            category = f"{r.folder} ({r.confidence:.2f})"
-            if folder != r.folder:
-                category += f" -> {folder} (unticked)"
-        self.msgs.put(("preview", path, opts, c, category))
-        self.msgs.put(("status", "Ready."))
+        if not self._check_ready():
+            return
+        self._start(self._do_preview, path, self._get_options(), self._extra(), mode=None)
 
     def _convert(self) -> None:
         root = self.src_root
@@ -1042,28 +1028,29 @@ class App(tk.Tk):
             messagebox.showerror("Convert", "The target folder must not be the source "
                                             "folder or inside it.")
             return
-        ticked = self._ticked() if self.v_auto.get() else None
-        opts = self._convert_options()
+        if not self._check_ready():
+            return
+        extra = self._extra()
+        opts = self._get_options()
         if self._tab() == _FOLDERS_TAB:
             if not any(self.states.values()):
                 messagebox.showinfo("Convert", "Tick at least one folder.")
                 return
             # Copy the tick states: the worker must not touch UI state.
             self._start(self._do_convert_folders, dict(self.states), root, dst_root,
-                        opts, self.v_move.get(), ticked, mode="folders")
+                        opts, self.v_move.get(), extra, mode="folders")
         else:
             if not self.src_files:
-                messagebox.showinfo("Convert", "No images listed.")
+                messagebox.showinfo("Convert", f"No {self.NOUN} listed.")
                 return
             sel = self.src_list.curselection()
             files = [self.src_files[i] for i in sel] if sel else list(self.src_files)
             self._start(self._do_convert, files, root, dst_root, opts,
-                        self.v_move.get(), ticked, mode="files")
+                        self.v_move.get(), extra, mode="files")
 
     def _do_convert_folders(self, states: Dict[str, bool], src_root: Path,
-                            dst_root: Path, opts: conv.ConvertOptions, move: bool,
-                            ticked: Optional[Set[str]]) -> None:
-        """List the images of the ticked folders (reading only folders that
+                            dst_root: Path, opts: Any, move: bool, extra: Any) -> None:
+        """List the files of the ticked folders (reading only folders that
         are ticked or hold a ticked subfolder), then convert them."""
         def included(key: str) -> bool:
             k: Optional[str] = key
@@ -1082,29 +1069,26 @@ class App(tk.Tk):
             return any(k.startswith(prefix) for k in true_keys)
 
         files: List[Path] = []
-        self.msgs.put(("status", "Listing images in the ticked folders..."))
+        self.msgs.put(("status", f"Listing {self.NOUN} in the ticked folders..."))
         errors = _walk(
             src_root, self.exts, self.stop_event,
-            lambda d, n: self.msgs.put(("status", f"Listing... {n:,} images in {d:,} folders")),
+            lambda d, n: self.msgs.put(("status", f"Listing... {n:,} {self.NOUN} "
+                                                  f"in {d:,} folders")),
             want_dir=want_dir,
-            on_image=lambda key, p, _s: files.append(p) if included(key) else None)
+            on_file=lambda key, p, _s: files.append(p) if included(key) else None)
         for e in errors[:20]:
             self.msgs.put(("log", f"ERROR reading {e}"))
         files.sort(key=lambda p: str(p).lower())
-        self._do_convert(files, src_root, dst_root, opts, move, ticked)
+        self._do_convert(files, src_root, dst_root, opts, move, extra)
 
     def _do_convert(self, files: List[Path], src_root: Path, dst_root: Path,
-                    opts: conv.ConvertOptions, move: bool,
-                    ticked: Optional[Set[str]]) -> None:
-        """Mirror the source structure: <dst>/<rel dir>/[<category>/]<name>.
-        `ticked` is None when auto categorize is off."""
-        auto = ticked is not None
+                    opts: Any, move: bool, extra: Any) -> None:
+        """Mirror the source structure: <dst>/<rel dir>/[<category>/]<name>."""
         n = len(files)
         before = after = 0
         done = 0
         self.msgs.put(("log", f"--- Converting {n} file(s) -> {dst_root} "
-                              f"({opts.fmt.upper()}, resize {opts.resize_mode} "
-                              f"{opts.resize_value}, move={move}, auto={auto})"))
+                              f"({self._describe(opts, extra)}, move={move})"))
         for i, path in enumerate(files, 1):
             if self.stop_event.is_set():
                 self.msgs.put(("log", "Stopped by user."))
@@ -1112,23 +1096,19 @@ class App(tk.Tk):
             self.msgs.put(("progress", i - 1, n))
             self.msgs.put(("status", f"{i}/{n}: {path.name}"))
             try:
-                c = conv.convert(path, opts)
-                out_dir = dst_root / path.parent.relative_to(src_root)
-                if ticked is not None:
-                    folder, _r = self._categorize(path, c, ticked)
-                    out_dir = out_dir / folder
-                out = conv.unique_path(out_dir, path.stem, opts.ext)
-                conv.write_output(out, c.data, path)
-                line = (f"{path.relative_to(src_root)} -> {out.relative_to(dst_root)}  "
-                        f"{_human(c.src_bytes)} -> {_human(len(c.data))} "
-                        f"({len(c.data) * 100 / max(1, c.src_bytes):.0f}%)")
+                src_bytes, out_bytes, line = self._convert_one(
+                    path, i, n, src_root, dst_root, opts, extra)
                 if move:
                     send_to_recycle_bin(path)
                     line += "  [source recycled]"
-                before += c.src_bytes
-                after += len(c.data)
+                before += src_bytes
+                after += out_bytes
                 done += 1
                 self.msgs.put(("log", line))
+            except vc.Cancelled:
+                self.msgs.put(("log", f"Stopped by user during {path.name} "
+                                      f"(nothing written, source kept)."))
+                break
             except Exception as e:
                 self.msgs.put(("log", f"ERROR {path}: {e} (source kept)"))
         self.msgs.put(("progress", n, max(n, 1)))
@@ -1137,23 +1117,369 @@ class App(tk.Tk):
         self.msgs.put(("log", summary))
         self.msgs.put(("status", summary))
 
-    def _on_close(self) -> None:
+    def shutdown(self) -> None:
+        """Window closes: stop work and scans, stop polling."""
         self.stop_event.set()
         for _gen, cancel in self.scans.values():
             cancel.set()
-        if self._save_job is not None:
-            self.after_cancel(self._save_job)
         if self._poll_job is not None:
             self.after_cancel(self._poll_job)
-        self._save_settings()
-        self.destroy()
+            self._poll_job = None
+
+
+class ImageTab(ConvertTab):
+    NOUN = "images"
+    PREVIEW_TEXT = "Preview"
+
+    def __init__(self, master: tk.Misc, app: App, data: Dict[str, Any]) -> None:
+        self.categories: List[str] = list(app.cfg.image_folders)
+        self.models_ready = False
+        super().__init__(master, app, data, set(app.cfg.ext_image))
+
+    def _make_option_vars(self) -> Dict[str, tk.Variable]:
+        self.v_resize = tk.StringVar(value="percent")
+        self.v_percent = tk.IntVar(value=50)
+        self.v_width = tk.IntVar(value=1920)
+        self.v_height = tk.IntVar(value=1920)
+        self.v_fmt = tk.StringVar(value="jpg")
+        self.v_quality = tk.IntVar(value=85)
+        self.v_auto = tk.BooleanVar(value=False)
+        self.v_cats: Dict[str, tk.BooleanVar] = {
+            c: tk.BooleanVar(value=True) for c in self.categories
+        }
+        return {"resize": self.v_resize, "percent": self.v_percent,
+                "width": self.v_width, "height": self.v_height, "fmt": self.v_fmt,
+                "quality": self.v_quality, "auto": self.v_auto}
+
+    def _load_settings(self, data: Dict[str, Any]) -> None:
+        super()._load_settings(data)
+        for c, on in data.get("categories", {}).items():
+            if c in self.v_cats:
+                self.v_cats[c].set(bool(on))
+
+    def settings(self) -> Dict[str, Any]:
+        data = super().settings()
+        data["categories"] = {c: v.get() for c, v in self.v_cats.items()}
+        return data
+
+    def _watch_vars(self) -> None:
+        super()._watch_vars()
+        for var in self.v_cats.values():
+            var.trace_add("write", self._schedule_save)
+
+    def _get_options(self) -> conv.ConvertOptions:
+        mode = self.v_resize.get()
+        value = {
+            "percent": self._int(self.v_percent, 100),
+            "width": self._int(self.v_width, 1920),
+            "height": self._int(self.v_height, 1920),
+        }.get(mode, 100)
+        return conv.ConvertOptions(
+            resize_mode=mode,
+            resize_value=max(1, value),
+            fmt=self.v_fmt.get(),
+            quality=min(100, max(1, self._int(self.v_quality, 85))),
+        )
+
+    def _describe(self, opts: conv.ConvertOptions, ticked: Optional[Set[str]]) -> str:
+        return (f"{opts.fmt.upper()}, resize {opts.resize_mode} {opts.resize_value}, "
+                f"auto={ticked is not None}")
+
+    def _build_options(self, c: ttk.Frame) -> None:
+        rs = ttk.LabelFrame(c, text="Resize (aspect ratio kept, never enlarged)")
+        rs.pack(fill="x", pady=(0, _PAD))
+        ttk.Radiobutton(rs, text="Keep size", value="none", variable=self.v_resize,
+                        command=self._sync_states).grid(row=0, column=0, sticky="w")
+        self.spins = {}
+        for row, (mode, label, var, hi, unit) in enumerate([
+            ("percent", "Percent", self.v_percent, 100, "%"),
+            ("width", "Width", self.v_width, 20000, "px"),
+            ("height", "Height", self.v_height, 20000, "px"),
+        ], start=1):
+            ttk.Radiobutton(rs, text=label, value=mode, variable=self.v_resize,
+                            command=self._sync_states).grid(row=row, column=0, sticky="w")
+            sp = ttk.Spinbox(rs, from_=1, to=hi, textvariable=var, width=7)
+            sp.grid(row=row, column=1, padx=4, pady=1)
+            ttk.Label(rs, text=unit).grid(row=row, column=2, sticky="w")
+            self.spins[mode] = sp
+
+        fm = ttk.LabelFrame(c, text="Target format")
+        fm.pack(fill="x", pady=(0, _PAD))
+        ttk.Radiobutton(fm, text="JPG", value="jpg", variable=self.v_fmt,
+                        command=self._sync_states).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(fm, text="PNG", value="png", variable=self.v_fmt,
+                        command=self._sync_states).grid(row=0, column=1, sticky="w")
+        ttk.Label(fm, text="JPG quality").grid(row=1, column=0, sticky="w")
+        self.q_label = ttk.Label(fm, width=4)
+        self.q_label.grid(row=1, column=1, sticky="e")
+        self.q_scale = ttk.Scale(fm, from_=1, to=100, orient="horizontal",
+                                 command=self._on_quality)
+        self.q_scale.set(self.v_quality.get())
+        self.q_scale.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2)
+        fm.columnconfigure(1, weight=1)
+
+        ac = ttk.LabelFrame(c, text="Categories")
+        ac.pack(fill="x", pady=(0, _PAD))
+        ttk.Checkbutton(ac, text="Auto categorize", variable=self.v_auto,
+                        command=self._sync_states).pack(anchor="w")
+        self.cat_checks = []
+        for cat in self.categories:
+            cb = ttk.Checkbutton(ac, text=cat, variable=self.v_cats[cat])
+            cb.pack(anchor="w", padx=(18, 0))
+            self.cat_checks.append(cb)
+        ttk.Label(ac, text=f"unticked -> {self.cfg.fallback_folder}",
+                  foreground="gray").pack(anchor="w", padx=(18, 0))
+
+    def _on_quality(self, value: str) -> None:
+        self.v_quality.set(int(float(value)))
+        self.q_label.configure(text=str(self.v_quality.get()))
+
+    def _sync_options(self) -> None:
+        for mode, sp in self.spins.items():
+            sp.configure(state="normal" if self.v_resize.get() == mode else "disabled")
+        self.q_scale.configure(state="normal" if self.v_fmt.get() == "jpg" else "disabled")
+        self.q_label.configure(text=str(self.v_quality.get()))
+        for cb in self.cat_checks:
+            cb.configure(state="normal" if self.v_auto.get() else "disabled")
+
+    def _extra(self) -> Optional[Set[str]]:
+        """Ticked categories, or None when auto categorize is off (read in
+        the UI thread: Tk variables must not be touched from the worker)."""
+        if not self.v_auto.get():
+            return None
+        return {c for c, v in self.v_cats.items() if v.get()}
+
+    def _ensure_models(self) -> None:
+        """Load CLIP once, in the worker thread (takes a few seconds)."""
+        if self.models_ready:
+            return
+        from .classifiers import clip
+        self.msgs.put(("status", "Loading AI models..."))
+        runtime.set_intra_op_threads(os.cpu_count() or 4)
+        clip.set_text_embeddings(clip.compute_text_embeddings(self.cfg))
+        sess = runtime.get_session(clip.vision_model_path(), self.cfg.use_gpu)
+        self.msgs.put(("log", "AI categorizing runs on: "
+                       + runtime.describe_provider(runtime.active_provider(sess))))
+        self.models_ready = True
+
+    def _categorize(self, path: Path, c: conv.Converted, ticked: Set[str]):
+        """Return (folder, ImageResult) for a converted image."""
+        from .classifiers import image as image_clf
+        self._ensure_models()
+        img = c.image if c.image.mode == "RGB" else c.image.convert("RGB")
+        if max(img.size) > 1024:
+            img = img.copy()
+            img.thumbnail((1024, 1024), Image.BILINEAR)
+        r = image_clf.classify_loaded(path, img, c.meta, self.cfg)
+        folder = r.folder
+        if r.error or folder not in ticked:
+            folder = self.cfg.fallback_folder
+        return folder, r
+
+    def _do_preview(self, path: Path, opts: conv.ConvertOptions,
+                    ticked: Optional[Set[str]]) -> None:
+        self.msgs.put(("status", f"Converting {path.name}..."))
+        c = conv.convert(path, opts)
+        category = None
+        if ticked is not None:
+            folder, r = self._categorize(path, c, ticked)
+            category = f"{r.folder} ({r.confidence:.2f})"
+            if folder != r.folder:
+                category += f" -> {folder} (unticked)"
+        self.msgs.put(("call", PreviewWindow, self, path, opts, c, category))
+        self.msgs.put(("status", "Ready."))
+
+    def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
+                     opts: conv.ConvertOptions,
+                     ticked: Optional[Set[str]]) -> Tuple[int, int, str]:
+        c = conv.convert(path, opts)
+        out_dir = dst_root / path.parent.relative_to(src_root)
+        if ticked is not None:
+            folder, _r = self._categorize(path, c, ticked)
+            out_dir = out_dir / folder
+        out = conv.unique_path(out_dir, path.stem, opts.ext)
+        conv.write_output(out, c.data, path)
+        line = (f"{path.relative_to(src_root)} -> {out.relative_to(dst_root)}  "
+                f"{_human(c.src_bytes)} -> {_human(len(c.data))} "
+                f"({len(c.data) * 100 / max(1, c.src_bytes):.0f}%)")
+        return c.src_bytes, len(c.data), line
+
+
+class VideoTab(ConvertTab):
+    NOUN = "videos"
+    PREVIEW_TEXT = "Test 10 s"
+
+    SIZES = [(0, "Keep"), (1080, "1080p"), (720, "720p"), (540, "540p"), (480, "480p")]
+    FPS = [(0, "Keep"), (60, "Max 60"), (30, "Max 30")]
+
+    def __init__(self, master: tk.Misc, app: App, data: Dict[str, Any]) -> None:
+        exts = app.cfg.raw.get("ext-video-convert")
+        ext_list = ([e.strip().lower() for e in exts.split(",") if e.strip()]
+                    if exts else vc.DEFAULT_EXTS)
+        self.tools = vc.find_tools(app.cfg.raw.get("ffmpeg-dir", ""))
+        super().__init__(master, app, data, set(ext_list))
+        if self.tools is None:
+            self._log("ffmpeg not found. Set 'ffmpeg-dir' in media-organizer.conf, "
+                      "or put ffmpeg.exe + ffprobe.exe in third_party\\ffmpeg\\bin.")
+        else:
+            self._log(f"ffmpeg: {self.tools.ffmpeg}")
+
+    def _make_option_vars(self) -> Dict[str, tk.Variable]:
+        self.v_size = tk.IntVar(value=720)
+        self.v_fps = tk.IntVar(value=30)
+        self.v_codec = tk.StringVar(value="hevc")
+        self.v_vquality = tk.StringVar(value="balanced")
+        self.v_encoder = tk.StringVar(value="cpu")
+        self.v_speed = tk.StringVar(value="medium")
+        self.v_audio = tk.StringVar(value="aac128")
+        return {"max_short": self.v_size, "max_fps": self.v_fps, "codec": self.v_codec,
+                "quality": self.v_vquality, "encoder": self.v_encoder,
+                "speed": self.v_speed, "audio": self.v_audio}
+
+    def _radios(self, parent: ttk.Frame, var: tk.Variable, items, per_row: int) -> None:
+        for k, (value, label) in enumerate(items):
+            ttk.Radiobutton(parent, text=label, value=value, variable=var,
+                            command=self._sync_states).grid(
+                row=k // per_row, column=k % per_row, sticky="w", padx=(0, 6))
+
+    def _build_options(self, c: ttk.Frame) -> None:
+        sz = ttk.LabelFrame(c, text="Max size (short side, never enlarged)")
+        sz.pack(fill="x", pady=(0, _PAD))
+        self._radios(sz, self.v_size, self.SIZES, 3)
+
+        fr = ttk.LabelFrame(c, text="Frame rate (only halved etc., no judder)")
+        fr.pack(fill="x", pady=(0, _PAD))
+        self._radios(fr, self.v_fps, self.FPS, 3)
+
+        cd = ttk.LabelFrame(c, text="Codec")
+        cd.pack(fill="x", pady=(0, _PAD))
+        self._radios(cd, self.v_codec, [("hevc", "HEVC / H.265 (smaller)"),
+                                         ("h264", "H.264 (plays everywhere)")], 1)
+
+        q = ttk.LabelFrame(c, text="Quality")
+        q.pack(fill="x", pady=(0, _PAD))
+        self._radios(q, self.v_vquality,
+                     [(k, vc.QUALITY_LABELS[k]) for k in vc.QUALITY_LEVELS], 2)
+        self.crf_label = ttk.Label(q, foreground="gray")
+        self.crf_label.grid(row=2, column=0, columnspan=2, sticky="w")
+
+        en = ttk.LabelFrame(c, text="Encoder")
+        en.pack(fill="x", pady=(0, _PAD))
+        self._radios(en, self.v_encoder, [("cpu", "CPU (safest)"),
+                                          ("gpu", "GPU NVIDIA (fast)")], 2)
+        ttk.Label(en, text="CPU speed").grid(row=1, column=0, sticky="w")
+        self.speed_box = ttk.Combobox(en, textvariable=self.v_speed, width=8,
+                                      state="readonly", values=["fast", "medium", "slow"])
+        self.speed_box.grid(row=1, column=1, sticky="w", pady=1)
+        ttk.Label(en, text="slow = a bit smaller, 2x time", foreground="gray").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+
+        au = ttk.LabelFrame(c, text="Audio (AAC, copied if already smaller)")
+        au.pack(fill="x", pady=(0, _PAD))
+        self._radios(au, self.v_audio, [("copy", "Keep"), ("aac128", "128 kbps"),
+                                        ("aac96", "96 kbps")], 3)
+
+    def _sync_options(self) -> None:
+        self.speed_box.configure(
+            state="readonly" if self.v_encoder.get() == "cpu" else "disabled")
+        opts = self._get_options()
+        self.crf_label.configure(text=f"{'CQ' if opts.encoder == 'gpu' else 'CRF'} "
+                                      f"{opts.crf()}  (lower = better, bigger)")
+
+    def _get_options(self) -> vc.VideoOptions:
+        def pick(var: tk.Variable, allowed, default):
+            try:
+                v = var.get()
+            except tk.TclError:
+                return default
+            return v if v in allowed else default
+        return vc.VideoOptions(
+            codec=pick(self.v_codec, ("hevc", "h264"), "hevc"),
+            encoder=pick(self.v_encoder, ("cpu", "gpu"), "cpu"),
+            max_short=pick(self.v_size, [s for s, _l in self.SIZES], 720),
+            max_fps=pick(self.v_fps, [f for f, _l in self.FPS], 30),
+            quality=pick(self.v_vquality, vc.QUALITY_LEVELS, "balanced"),
+            speed=pick(self.v_speed, ("fast", "medium", "slow"), "medium"),
+            audio=pick(self.v_audio, ("copy", "aac128", "aac96"), "aac128"),
+        )
+
+    def _describe(self, opts: vc.VideoOptions, _extra: Any) -> str:
+        return opts.describe()
+
+    def _check_ready(self) -> bool:
+        if self.tools is None:
+            messagebox.showerror("ffmpeg", "ffmpeg not found. Set 'ffmpeg-dir' in "
+                                           "media-organizer.conf.")
+            return False
+        return True
+
+    def _ready_options(self, opts: vc.VideoOptions) -> vc.VideoOptions:
+        """Worker thread: fall back to the CPU if NVENC does not work."""
+        assert self.tools is not None
+        if opts.encoder == "gpu" and not vc.gpu_available(self.tools, opts.codec):
+            self.msgs.put(("log", "GPU encoder (NVENC) not available: using the CPU."))
+            opts.encoder = "cpu"
+        return opts
+
+    def _file_progress(self, i: int, n: int, name: str) -> Callable[[float], None]:
+        last = [-1]
+
+        def report(x: float) -> None:
+            pct = int(x * 100)
+            if pct != last[0]:
+                last[0] = pct
+                self.msgs.put(("progress", i - 1 + x, n))
+                step = "verifying" if x >= 0.9 and x < 1 else f"{pct}%"
+                self.msgs.put(("status", f"{i}/{n}: {name}  {step}"))
+        return report
+
+    def _do_preview(self, path: Path, opts: vc.VideoOptions, _extra: Any) -> None:
+        assert self.tools is not None
+        opts = self._ready_options(opts)
+        folder = Path(tempfile.gettempdir()) / "MediaOrganizer"
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in folder.glob("test-*.mp4"):
+            try:
+                old.unlink()
+            except OSError:
+                pass                   # still open in a player
+        out = conv.unique_path(folder, f"test-{path.stem}", ".mp4")
+        self.msgs.put(("status", f"Test encode of {path.name}..."))
+        info, p, size = vc.preview_clip(self.tools, path, out, opts, self.stop_event,
+                                        self._file_progress(1, 1, path.name))
+        seconds = min(10.0, info.duration)
+        est = size / seconds * info.duration
+        self.msgs.put(("log", f"Test {path.name}: {seconds:.0f} s from the middle, "
+                              f"{p.describe(info)} ({opts.describe()})"))
+        self.msgs.put(("log", f"    {_human(size)} -> whole video about {_human(est)} "
+                              f"instead of {_human(info.size)} "
+                              f"({est * 100 / max(1, info.size):.0f}%).  File: {out}"))
+        vc.play(self.tools, out, f"Test - {path.name} - {p.size[0]}x{p.size[1]}")
+        self.msgs.put(("status", "Ready."))
+
+    def _do_convert(self, files: List[Path], src_root: Path, dst_root: Path,
+                    opts: vc.VideoOptions, move: bool, extra: Any) -> None:
+        super()._do_convert(files, src_root, dst_root, self._ready_options(opts),
+                            move, extra)
+
+    def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
+                     opts: vc.VideoOptions, _extra: Any) -> Tuple[int, int, str]:
+        assert self.tools is not None
+        out_dir = dst_root / path.parent.relative_to(src_root)
+        r = vc.convert_file(self.tools, path, out_dir, opts, self.stop_event,
+                            self._file_progress(i, n, path.name),
+                            conv.unique_path, conv.copy_file_times)
+        line = (f"{path.relative_to(src_root)} -> {r.out.relative_to(dst_root)}  "
+                f"{_human(r.src_bytes)} -> {_human(r.out_bytes)} "
+                f"({r.out_bytes * 100 / max(1, r.src_bytes):.0f}%)  {r.summary}")
+        return r.src_bytes, r.out_bytes, line
 
 
 class PreviewWindow(tk.Toplevel):
     """Shows the converted image at 1:1 (no fitting to the screen), with
     scrollbars, drag-to-pan and a size overlay that stays in the corner."""
 
-    def __init__(self, master: App, path: Path, opts: conv.ConvertOptions,
+    def __init__(self, master: tk.Misc, path: Path, opts: conv.ConvertOptions,
                  c: conv.Converted, category: Optional[str]) -> None:
         super().__init__(master)
         # Decode the encoded bytes, so JPG artifacts are visible as they will be.
