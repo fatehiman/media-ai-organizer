@@ -63,6 +63,7 @@ _CRF = {
     ("gpu", "hevc"): {"very_high": 21, "high": 24, "balanced": 27, "small": 29},
     ("gpu", "h264"): {"very_high": 19, "high": 22, "balanced": 25, "small": 27},
 }
+_SLOW_CRF_OFFSET = {"slow": 2}
 _NVENC = {"hevc": "hevc_nvenc", "h264": "h264_nvenc"}
 _X26X = {"hevc": "libx265", "h264": "libx264"}
 _AUDIO_KBPS = {"aac128": 128, "aac96": 96}
@@ -99,6 +100,10 @@ class Cancelled(Exception):
     """Stopped by the user; the half-written output was removed."""
 
 
+class Skipped(Exception):
+    """The user chose not to convert this file (the target exists)."""
+
+
 @dataclass
 class VideoOptions:
     codec: str = "hevc"          # hevc | h264
@@ -106,11 +111,17 @@ class VideoOptions:
     max_short: int = 720         # limit of the short side in px, 0 = keep
     max_fps: int = 30            # 0 = keep
     quality: str = "balanced"    # see QUALITY_LEVELS
-    speed: str = "medium"        # CPU preset: fast | medium | slow
+    speed: str = "slow"          # CPU preset: fast | medium | slow
     audio: str = "aac128"        # copy | aac128 | aac96
 
     def crf(self) -> int:
-        return _CRF[(self.encoder, self.codec)][self.quality]
+        crf = _CRF[(self.encoder, self.codec)][self.quality]
+        if self.encoder == "cpu" and self.codec == "hevc":
+            # Same look at every speed: x265 "slow" at the same CRF gives a
+            # bigger file with *higher* quality; CRF + 2 gives the medium
+            # quality at 15-30 % less size (VMAF-checked).
+            crf += _SLOW_CRF_OFFSET.get(self.speed, 0)
+        return crf
 
     def describe(self) -> str:
         enc = "GPU NVENC" if self.encoder == "gpu" else f"CPU {self.speed}"
@@ -646,14 +657,16 @@ def _part_path(dst: Path) -> Path:
 
 def convert_file(tools: Tools, src: Path, dst_dir: Path, opts: VideoOptions,
                  cancel: threading.Event, progress: Callable[[float], None],
-                 unique_path: Callable[[Path, str, str], Path],
+                 target_path: Callable[[Path, str, str], Path],
                  copy_times: Callable[[Path, Path], None]) -> Result:
-    """Convert src to dst_dir/<stem>.mp4 (a free name).  If the result is
-    not smaller than the source, the source is copied unchanged instead."""
+    """Convert src to dst_dir/<stem>.mp4.  target_path(folder, stem, ext)
+    picks the output path (a free name, or an existing file to overwrite);
+    it may raise Skipped / Cancelled.  If the result is not smaller than
+    the source, the source is copied unchanged instead."""
     info = probe(tools, src)
     p = plan(info, opts)
+    dst = target_path(dst_dir, src.stem, ".mp4")
     dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = unique_path(dst_dir, src.stem, ".mp4")
     part = _part_path(dst)
     try:
         _encode(tools, src, part, p, info.duration, cancel,
@@ -666,7 +679,7 @@ def convert_file(tools: Tools, src: Path, dst_dir: Path, opts: VideoOptions,
         out_bytes = part.stat().st_size
         if out_bytes >= info.size:
             part.unlink()
-            dst = unique_path(dst_dir, src.stem, src.suffix.lower())
+            dst = target_path(dst_dir, src.stem, src.suffix.lower())
             tmp = dst.with_name(dst.name + ".part")
             shutil.copyfile(src, tmp)
             os.replace(tmp, dst)
@@ -679,6 +692,39 @@ def convert_file(tools: Tools, src: Path, dst_dir: Path, opts: VideoOptions,
                       p.describe(info) + f", color diff {check.color_diff:.1f}")
     finally:
         part.unlink(missing_ok=True)
+
+
+def details(tools: Tools, path: Path) -> Dict[str, str]:
+    """Facts shown in the overwrite dialog: date taken, resolution, length."""
+    out: Dict[str, str] = {}
+    try:
+        data = _probe_json(tools, path)
+    except (VideoError, ValueError, subprocess.SubprocessError):
+        return out
+    tags = {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
+    taken = tags.get("com.apple.quicktime.creationdate")
+    if taken:
+        out["taken"] = taken.replace("T", " ")[:19]
+    elif tags.get("creation_time"):
+        from datetime import datetime
+        try:
+            utc = datetime.fromisoformat(tags["creation_time"].replace("Z", "+00:00"))
+            out["taken"] = utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            out["taken"] = tags["creation_time"]
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and s.get("width"):
+            w, h = int(s["width"]), int(s["height"])
+            if abs(_rotation(s)) % 180 == 90:
+                w, h = h, w
+            out["resolution"] = f"{w} x {h}  ({s.get('codec_name', '?')})"
+            break
+    try:
+        sec = float(data.get("format", {}).get("duration") or 0)
+        out["duration"] = f"{int(sec // 60)}:{sec % 60:04.1f}"
+    except ValueError:
+        pass
+    return out
 
 
 def preview_clip(tools: Tools, src: Path, out: Path, opts: VideoOptions,

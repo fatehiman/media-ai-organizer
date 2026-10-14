@@ -402,6 +402,12 @@ were worse than 0.5.
     *Include subfolders*). The target list is read only on Refresh and
     after a Files-view run. After a Folders-view run the counts are only
     cleared, not re-read.
+  - During a run the worker sends `("dst_add", dst_root, path, size)`
+    after each written file; `_dst_add` inserts it (bisect, sorted like
+    a scan) or updates it (overwrite). If `dst_listed` is another folder
+    or None, the list restarts empty for this run.
+  - Files view: the selection at Convert time is kept in `_reselect` and
+    re-applied by `_files_scanned` after the post-run re-read.
 - **Walker** (`_walk`): explicit stack + `os.scandir`; on Windows
   `DirEntry.stat()` / `is_dir()` come from the directory listing, so no
   extra disk access per file. Folder keys are posix paths relative to the
@@ -419,7 +425,27 @@ were worse than 0.5.
   in both views. A target equal to or inside the source is refused
   (otherwise outputs would be listed and converted again).
 - **Window placement**: `_center()` sizes the window (clipped to the
-  screen) and centers it; used for the main and the preview window.
+  screen) and centers it; used for the main and the preview window. The
+  main window is built withdrawn, then centered after
+  `update_idletasks()` and shown, so it never flashes at another place.
+- **Single instance**: `main()` creates the named mutex
+  `Local\MediaOrganizerGUI`; if it already exists
+  (`ERROR_ALREADY_EXISTS` = 183) the running window (title
+  `Media Organizer * - Convert`, found with `EnumWindows`) is restored
+  and brought to the front, and the new process exits.
+- **Ask for overwrite**: `_target_path(src)` returns the function that
+  picks every output path (images: after categorize; videos: inside
+  `convert_file`, before encoding, and again for the "original copied"
+  case). Off → the plain path: an existing file is overwritten
+  (`os.replace`), as the user wants. On and the file exists → the
+  worker builds the facts of both files (`_facts`: stat +
+  `conv.details` / `vc.details`: EXIF DateTimeOriginal or QuickTime
+  creationdate / creation_time in local time, resolution, length), posts
+  `OverwriteDialog` to the UI thread and waits on an `Event` (checking
+  `stop_event`). Answers: `skip`, `overwrite`, `rename`, their `_all`
+  forms (stored in `_run_choice` for the rest of the run) and `stop`.
+  Skip raises `vc.Skipped`, stop raises `vc.Cancelled`; both keep the
+  source.
 - **Don't name methods like Tk internals**: a method called `_options`
   on a Tk widget subclass (`tk.Tk` before, now the `ttk.Frame` tabs)
   breaks widget creation / `columnconfigure` (Tk calls
@@ -524,6 +550,18 @@ choice below is about avoiding stutter, color errors or broken frames.
   source): x265 CRF 23 = 91.8 (70 % size), 26 = 88.8 (44 %), 28 = 85.9
   (32 %); NVENC CQ 26 = 87.8 (40 %). x265 preset medium ≈ 1.5× real
   time for 720p on a 20-thread laptop CPU, NVENC ≈ 5×.
+- **x265 preset vs CRF** (30 s clips, 720p, VMAF):
+
+  | clip | fast CRF 26 | medium CRF 26 | slow CRF 26 | slow CRF 28 |
+  |---|---|---|---|---|
+  | busy | 3.83 MB / 92.1 | 4.25 MB / 92.5 | 4.92 MB / 95.0 | 3.60 MB / 92.7 |
+  | calm | 1.16 MB / 88.2 | 1.20 MB / 87.9 | 1.43 MB / 89.6 | 0.84 MB / 88.0 |
+  | time | 6.4 s | 7.0 s | 15.8 s | ~16 s |
+
+  At the same CRF `slow` gives a *bigger* file with higher quality; at
+  the same quality (CRF + 2) it is 15–30 % smaller. So `crf()` adds
+  `_SLOW_CRF_OFFSET` (+2) for CPU HEVC `slow`, and `slow` is the
+  default. `fast` ≈ `medium` in this build.
 - **HEVC tag**: `-tag:v hvc1` (Apple players refuse `hev1`).
 - **Audio**: the first decodable audio stream (AAC preferred; iPhone
   spatial audio tracks ffmpeg can't decode are skipped). Copied when it

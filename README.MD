@@ -117,8 +117,9 @@ again — it will offer to resume from where it stopped.
 
 ## GUI: convert & categorize
 
-Double-click `media-organizer-gui.exe`. The window opens in the center
-of the screen. It has two main tabs on top: **Pictures** (this section)
+Double-click `media-organizer-gui.exe`. The window always opens in the
+center of the screen. Only one copy of the app can run: starting it again
+brings the open window to the front. It has two main tabs on top: **Pictures** (this section)
 and **Videos** (see [GUI: Videos tab](#gui-videos-tab)). Each tab has its
 own source, target and settings; the source / target panes work the same
 in both. The app opens on the tab you used last.
@@ -161,11 +162,17 @@ or HDD drive), so it reads the disk as little as possible.
   - **Files**: a list of images, read only when you open this tab.
     *Include subfolders* lists images in all subfolders too. *Convert*
     uses the selected files, or all listed files when none is selected.
+    After the run the list is read again and the selected files stay
+    selected (the ones that still exist: with Move they are gone, unless
+    they failed).
   - Reading runs in the background with a progress bar ("Scanning… N
     images in M folders"); the window stays usable. Folders that can't be
     read (e.g. a failing drive) are written to the log and skipped.
 - **Target pane**: the target folder. Its file list is read only when
   you press **Refresh** (and after a Files-view run), not at start.
+  **During a run** every new file is added to the list at once (no disk
+  read), so you can watch the folders and files being created. If the
+  list was not read before, it shows only the files of this run.
   Double-click a file to open it. The target must not be the source
   folder or inside it.
 - **Folder structure is kept**: the path below the source folder is
@@ -196,15 +203,36 @@ or HDD drive), so it reads the disk as little as possible.
   `original -> converted` size, file size with percent, and the detected
   category.
 - **Stop** stops after the current file.
+- **Ask for overwrite** (off by default; in both tabs): what happens when
+  the target file already exists.
+  - Off: an existing target file is **overwritten without asking**; the
+    name stays the same. (So two sources in one folder with the same name
+    but another extension, e.g. `IMG_1.HEIC` and `IMG_1.JPG`, both become
+    `IMG_1.jpg` and the second one wins. Turn the option on to see such
+    cases.)
+  - On: a window shows both files (name, folder, size, file date, date
+    taken, resolution, and length for videos) and asks:
+
+    | This file | This and all next existing files |
+    |---|---|
+    | Skip this file | Skip this and all next existing files |
+    | Overwrite this file | Overwrite this and all next existing files |
+    | Save with a new name (` (2)`) | New name for this and all next existing files |
+
+    and **Cancel: stop converting**. Closing the window (or `Esc`) skips
+    the file. A skipped file is not converted and its source is never
+    deleted. A video is asked about *before* it is encoded, so no time is
+    lost on a skipped file.
 - **Settings are remembered**: source and target folders, ticked folders,
-  resize / format / quality, Move, Auto categorize and the ticked
+  resize / format / quality, Move, Ask for overwrite, Auto categorize and the ticked
   categories (not the view: the app always starts in Folders view). They are saved as soon as they change (in
   `%APPDATA%\MediaOrganizer\gui.json`).
 
 Per file the order is: convert in memory → detect the category on the
 small converted image (faster than on the big original) → save → recycle
 the source. The source's metadata is read **before** converting, so
-screenshot detection still works. Name collisions get a ` (2)` suffix.
+screenshot detection still works. Name collisions: see *Ask for
+overwrite* above.
 
 **Metadata is always copied** — there is no option to turn it off. Every
 piece the target format can hold is copied:
@@ -253,7 +281,7 @@ and the mirrored folder structure work exactly like the Pictures tab:
 `<source>\2026\trip\VID_1.mov` → `<target>\2026\trip\VID_1.mp4`.
 
 Defaults (good for keeping memories, small storage bill):
-**720p, max 30 fps, HEVC, Balanced, CPU, AAC 128 kbps**. Tested on
+**720p, max 30 fps, HEVC, Balanced, CPU slow, AAC 128 kbps**. Tested on
 Samsung and iPhone videos (720p–1080p H.264, iPhone HDR HEVC, Live
 Photo clips): the result is **3–45 %** of the original size (iPhone
 HDR: ~30 %), and the picture is hard to tell from the original.
@@ -278,8 +306,20 @@ HDR: ~30 %), and the picture is hard to tell from the original.
   safest. *GPU NVIDIA* (NVENC) is ~3–4× faster but the files are a bit
   bigger. Video is always **decoded on the CPU** — GPU decoding is the
   usual cause of the "all blue" videos some converters make. If the GPU
-  encoder is not available, the CPU is used. *CPU speed* `slow` makes
-  files a bit smaller and takes ~2× the time.
+  encoder is not available, the CPU is used.
+- **CPU speed** (HEVC on CPU), measured on phone clips with VMAF:
+
+  | Speed | Time | File size at the same look | Note |
+  |---|---|---|---|
+  | fast | ~0.9× | ~same as medium | almost no gain in this ffmpeg build |
+  | medium | 1× | 100 % | |
+  | **slow** (default) | ~2.3× | **70–85 %** | same look, smaller file |
+
+  The quality levels mean the *same look* at every speed: with `slow`
+  the app uses CRF + 2 (shown under Quality). Without that, `slow` at the
+  same CRF makes a slightly *bigger* file with higher quality, which is
+  not the goal here. Speed never changes the frame timing, colors or
+  sync — only how hard the encoder searches.
 - **Audio**: AAC. If the source audio is already AAC at the chosen
   bitrate or lower, it is copied unchanged.
 - **HDR** (iPhone HDR / Dolby Vision): kept as 10-bit HDR (HLG) with

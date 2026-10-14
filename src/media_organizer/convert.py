@@ -245,6 +245,24 @@ def convert(path: Path, opts: ConvertOptions) -> Converted:
                      src_size=(w, h), src_bytes=src_bytes)
 
 
+def details(path: Path) -> Dict[str, str]:
+    """Facts shown in the overwrite dialog: date taken and resolution."""
+    out: Dict[str, str] = {}
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            w, h = img.size
+            if exif.get(_EXIF_ORIENTATION, 1) in _SWAPS_AXES:
+                w, h = h, w
+            out["resolution"] = f"{w} x {h}  ({img.format})"
+            taken = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+            if taken:
+                out["taken"] = str(taken).replace(":", "-", 2)
+    except Exception:
+        pass
+    return out
+
+
 # --- output ------------------------------------------------------------------
 
 def unique_path(folder: Path, stem: str, ext: str) -> Path:

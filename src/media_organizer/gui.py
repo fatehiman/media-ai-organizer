@@ -38,10 +38,13 @@ Per file (one at a time, in a worker thread):
 
 from __future__ import annotations
 
+import bisect
+import ctypes
 import io
 import json
 import os
 import queue
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -61,6 +64,7 @@ from .trash import send_to_recycle_bin
 
 _PAD = 6
 _WIN_W, _WIN_H = 1280, 800
+_TITLE = f"Media Organizer {__version__} - Convert"
 _FOLDERS_TAB, _FILES_TAB = 0, 1
 _DUMMY = "|dummy"             # placeholder child: "not loaded yet" (| is not
                                # allowed in Windows file names)
@@ -169,9 +173,9 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"Media Organizer {__version__} - Convert")
+        self.withdraw()               # shown centered once it is built
+        self.title(_TITLE)
         self.minsize(1000, 640)
-        _center(self, _WIN_W, _WIN_H)
 
         try:
             self.cfg = config_module.load(_config_path(), require_paths=False)
@@ -198,6 +202,12 @@ class App(tk.Tk):
         self.main_tabs.bind("<<NotebookTabChanged>>", self.schedule_save)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Always open in the center of the screen (position is not saved).
+        self.update_idletasks()
+        _center(self, _WIN_W, _WIN_H)
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     @property
     def tabs_list(self) -> List["ConvertTab"]:
@@ -272,6 +282,13 @@ class ConvertTab(ttk.Frame):
         self.src_scan: List[ScanEntry] = []
         self.src_files: List[Path] = []
         self.dst_files: List[Path] = []
+        self.dst_sizes: Dict[Path, int] = {}
+        self.dst_listed: Optional[Path] = None   # folder the target list shows
+        self._reselect: Set[Path] = set()        # Files view: select after re-read
+        # Overwrite handling of the current run (set in the UI thread).
+        self._ask_run = False
+        self._run_choice: Optional[str] = None   # "skip_all" / "overwrite_all" / ...
+        self._dialog: Optional[tk.Toplevel] = None
         self.scans: Dict[str, Tuple[int, threading.Event]] = {}
         self._scan_gen = 0
         self._files_errors: List[str] = []
@@ -318,10 +335,15 @@ class ConvertTab(ttk.Frame):
     def _do_preview(self, path: Path, opts: Any, extra: Any) -> None:
         raise NotImplementedError
 
-    def _convert_one(self, path: Path, i: int, n: int, src_root: Path,
-                     dst_root: Path, opts: Any, extra: Any) -> Tuple[int, int, str]:
-        """Convert one file; returns (source bytes, output bytes, log line)."""
+    def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
+                     opts: Any, extra: Any) -> Tuple[int, Path, int, str]:
+        """Convert one file; returns (source bytes, output path, output
+        bytes, log line).  Gets its output path from _target_path()."""
         raise NotImplementedError
+
+    def _details(self, path: Path) -> Dict[str, str]:
+        """Date taken / resolution / length of a file (overwrite dialog)."""
+        return {}
 
     # --- settings ------------------------------------------------------------
 
@@ -330,12 +352,13 @@ class ConvertTab(ttk.Frame):
         self.v_dst = tk.StringVar()
         self.v_subfolders = tk.BooleanVar(value=False)
         self.v_move = tk.BooleanVar(value=False)
+        self.v_ask = tk.BooleanVar(value=False)
         self.v_status = tk.StringVar(value="Ready.")
         self.option_vars = self._make_option_vars()
 
     def _simple_vars(self) -> Dict[str, tk.Variable]:
         return {"src": self.v_src, "dst": self.v_dst, "subfolders": self.v_subfolders,
-                "move": self.v_move, **self.option_vars}
+                "move": self.v_move, "ask_overwrite": self.v_ask, **self.option_vars}
 
     def _load_settings(self, data: Dict[str, Any]) -> None:
         for key, var in self._simple_vars().items():
@@ -496,6 +519,10 @@ class ConvertTab(ttk.Frame):
         self._build_options(c)
 
         ttk.Checkbutton(c, text="Move (del source)", variable=self.v_move).pack(
+            anchor="w")
+        ttk.Checkbutton(c, text="Ask for overwrite", variable=self.v_ask).pack(anchor="w")
+        ttk.Label(c, text="(off: an existing target file is\n"
+                          " overwritten without asking)", foreground="gray").pack(
             anchor="w", pady=(0, _PAD))
 
         btns = ttk.Frame(c)
@@ -582,7 +609,7 @@ class ConvertTab(ttk.Frame):
         root = Path(text) if text else None
         if root is None or not root.is_dir():
             self._cancel_scan("dst")
-            self.dst_files = []
+            self.dst_files, self.dst_sizes, self.dst_listed = [], {}, None
             self.dst_list.delete(0, tk.END)
             self.dst_info.configure(text="Folder not found." if root else "")
             return
@@ -596,12 +623,43 @@ class ConvertTab(ttk.Frame):
     def _dst_done(self, root: Path, entries: List[ScanEntry], errors: List[str]) -> None:
         entries.sort(key=lambda e: str(e[0]).lower())
         self.dst_files = [p for p, _s in entries]
+        self.dst_sizes = dict(entries)
+        self.dst_listed = root
         self.dst_list.delete(0, tk.END)
         if entries:
-            self.dst_list.insert(tk.END, *[
-                f"{p.relative_to(root)}   ({_human(s)})" for p, s in entries])
+            self.dst_list.insert(tk.END, *[self._dst_text(p, s) for p, s in entries])
         self.dst_info.configure(text=self._summary(len(entries), sum(s for _p, s in entries),
                                                    errors))
+
+    def _dst_text(self, p: Path, size: int) -> str:
+        assert self.dst_listed is not None
+        try:
+            rel = p.relative_to(self.dst_listed)
+        except ValueError:
+            rel = p
+        return f"{rel}   ({_human(size)})"
+
+    def _dst_add(self, root: Path, path: Path, size: int) -> None:
+        """A file was written during a run: show it in the target list at
+        once (no disk read).  If the list shows another folder (or was
+        never read), it starts empty with the files of this run."""
+        if self.dst_listed is None or os.path.normcase(str(self.dst_listed.resolve())) \
+                != os.path.normcase(str(root)):
+            self._cancel_scan("dst")
+            self.dst_files, self.dst_sizes, self.dst_listed = [], {}, root
+            self.dst_list.delete(0, tk.END)
+        key = str(path).lower()
+        keys = [str(f).lower() for f in self.dst_files]
+        i = bisect.bisect_left(keys, key)
+        if i < len(keys) and keys[i] == key:          # overwritten
+            self.dst_list.delete(i)
+        else:
+            self.dst_files.insert(i, path)
+        self.dst_sizes[path] = size
+        self.dst_list.insert(i, self._dst_text(path, size))
+        self.dst_list.see(i)
+        self.dst_info.configure(text=self._summary(
+            len(self.dst_files), sum(self.dst_sizes.values()), []))
 
     # --- background scans --------------------------------------------------------
 
@@ -861,6 +919,16 @@ class ConvertTab(ttk.Frame):
         if entries:
             self.src_list.insert(tk.END, *[
                 f"{p.relative_to(root)}   ({_human(s)})" for p, s in entries])
+        # After a run: select again the files that were selected (and still
+        # exist; with Move they are gone unless they failed).
+        first = None
+        for i, path in enumerate(self.src_files):
+            if path in self._reselect:
+                self.src_list.selection_set(i)
+                first = i if first is None else first
+        if first is not None:
+            self.src_list.see(first)
+        self._reselect = set()
         self._files_errors = errors
         self._update_info()
 
@@ -937,6 +1005,8 @@ class ConvertTab(ttk.Frame):
                         self._scan_finished(msg[1], msg[3], msg[4])
                 elif kind == "call":
                     msg[1](*msg[2:])
+                elif kind == "dst_add":
+                    self._dst_add(msg[1], msg[2], msg[3])
                 elif kind == "done":
                     self.worker = None
                     self._after_run(msg[1])
@@ -946,6 +1016,9 @@ class ConvertTab(ttk.Frame):
 
     def _after_run(self, mode: Optional[str]) -> None:
         """mode: None (preview), "files" or "folders" (a convert run)."""
+        if self._dialog is not None and self._dialog.winfo_exists():
+            self._dialog.destroy()           # stopped while it was open
+        self._dialog = None
         self._sync_states()
         if mode == "files":
             self._scan_files()
@@ -1032,6 +1105,8 @@ class ConvertTab(ttk.Frame):
             return
         extra = self._extra()
         opts = self._get_options()
+        self._ask_run = self.v_ask.get()
+        self._run_choice = None
         if self._tab() == _FOLDERS_TAB:
             if not any(self.states.values()):
                 messagebox.showinfo("Convert", "Tick at least one folder.")
@@ -1045,6 +1120,7 @@ class ConvertTab(ttk.Frame):
                 return
             sel = self.src_list.curselection()
             files = [self.src_files[i] for i in sel] if sel else list(self.src_files)
+            self._reselect = {self.src_files[i] for i in sel}
             self._start(self._do_convert, files, root, dst_root, opts,
                         self.v_move.get(), extra, mode="files")
 
@@ -1086,7 +1162,7 @@ class ConvertTab(ttk.Frame):
         """Mirror the source structure: <dst>/<rel dir>/[<category>/]<name>."""
         n = len(files)
         before = after = 0
-        done = 0
+        done = skipped = 0
         self.msgs.put(("log", f"--- Converting {n} file(s) -> {dst_root} "
                               f"({self._describe(opts, extra)}, move={move})"))
         for i, path in enumerate(files, 1):
@@ -1096,8 +1172,9 @@ class ConvertTab(ttk.Frame):
             self.msgs.put(("progress", i - 1, n))
             self.msgs.put(("status", f"{i}/{n}: {path.name}"))
             try:
-                src_bytes, out_bytes, line = self._convert_one(
+                src_bytes, out, out_bytes, line = self._convert_one(
                     path, i, n, src_root, dst_root, opts, extra)
+                self.msgs.put(("dst_add", dst_root, out, out_bytes))
                 if move:
                     send_to_recycle_bin(path)
                     line += "  [source recycled]"
@@ -1105,6 +1182,10 @@ class ConvertTab(ttk.Frame):
                 after += out_bytes
                 done += 1
                 self.msgs.put(("log", line))
+            except vc.Skipped:
+                skipped += 1
+                self.msgs.put(("log", f"{path.relative_to(src_root)}: skipped, the "
+                                      f"target exists (source kept)"))
             except vc.Cancelled:
                 self.msgs.put(("log", f"Stopped by user during {path.name} "
                                       f"(nothing written, source kept)."))
@@ -1113,9 +1194,68 @@ class ConvertTab(ttk.Frame):
                 self.msgs.put(("log", f"ERROR {path}: {e} (source kept)"))
         self.msgs.put(("progress", n, max(n, 1)))
         summary = (f"Done: {done}/{n} converted, {_human(before)} -> {_human(after)}"
-                   + (f" ({after * 100 / before:.0f}%)" if before else ""))
+                   + (f" ({after * 100 / before:.0f}%)" if before else "")
+                   + (f", {skipped} skipped" if skipped else ""))
         self.msgs.put(("log", summary))
         self.msgs.put(("status", summary))
+
+    def _target_path(self, src: Path) -> Callable[[Path, str, str], Path]:
+        """Worker thread: a function (folder, stem, ext) -> output path.
+        "Ask for overwrite" off: overwrite an existing file, same name.
+        On: if the file exists, ask (or use the "all" answer given before);
+        raises vc.Skipped / vc.Cancelled."""
+        def pick(folder: Path, stem: str, ext: str) -> Path:
+            dst = folder / f"{stem}{ext}"
+            if not self._ask_run or not dst.exists():
+                return dst
+            choice = self._run_choice
+            if choice is None:
+                choice = self._ask_overwrite(src, dst, conv.unique_path(folder, stem, ext))
+                if choice.endswith("_all"):
+                    self._run_choice = choice
+            action = choice.replace("_all", "")
+            if action == "skip":
+                raise vc.Skipped()
+            if action == "stop":
+                self.stop_event.set()
+                raise vc.Cancelled()
+            if action == "rename":
+                return conv.unique_path(folder, stem, ext)
+            return dst                                  # overwrite
+        return pick
+
+    def _facts(self, path: Path) -> Dict[str, str]:
+        from datetime import datetime
+        facts = {"name": path.name, "folder": str(path.parent)}
+        try:
+            st = path.stat()
+            facts["size"] = f"{_human(st.st_size)}  ({st.st_size:,} bytes)"
+            facts["modified"] = datetime.fromtimestamp(st.st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S")
+        except OSError:
+            pass
+        facts.update(self._details(path))
+        return facts
+
+    def _ask_overwrite(self, src: Path, dst: Path, new_path: Path) -> str:
+        """Worker thread: show the dialog in the UI thread, wait for it."""
+        answer: Dict[str, str] = {}
+        event = threading.Event()
+
+        def done(choice: str) -> None:
+            answer["choice"] = choice
+            event.set()
+
+        facts = (self._facts(src), self._facts(dst))
+        self.msgs.put(("status", f"{dst.name} exists: waiting for your answer..."))
+        self.msgs.put(("call", self._open_dialog, facts, new_path.name, done))
+        while not event.wait(0.2):
+            if self.stop_event.is_set():
+                raise vc.Cancelled()
+        return answer["choice"]
+
+    def _open_dialog(self, facts, new_name: str, done) -> None:
+        self._dialog = OverwriteDialog(self, facts[0], facts[1], new_name, done)
 
     def shutdown(self) -> None:
         """Window closes: stop work and scans, stop polling."""
@@ -1291,18 +1431,23 @@ class ImageTab(ConvertTab):
 
     def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
                      opts: conv.ConvertOptions,
-                     ticked: Optional[Set[str]]) -> Tuple[int, int, str]:
+                     ticked: Optional[Set[str]]) -> Tuple[int, Path, int, str]:
         c = conv.convert(path, opts)
         out_dir = dst_root / path.parent.relative_to(src_root)
         if ticked is not None:
             folder, _r = self._categorize(path, c, ticked)
             out_dir = out_dir / folder
-        out = conv.unique_path(out_dir, path.stem, opts.ext)
+        out = self._target_path(path)(out_dir, path.stem, opts.ext)
+        overwrite = out.exists()
         conv.write_output(out, c.data, path)
         line = (f"{path.relative_to(src_root)} -> {out.relative_to(dst_root)}  "
                 f"{_human(c.src_bytes)} -> {_human(len(c.data))} "
-                f"({len(c.data) * 100 / max(1, c.src_bytes):.0f}%)")
-        return c.src_bytes, len(c.data), line
+                f"({len(c.data) * 100 / max(1, c.src_bytes):.0f}%)"
+                + ("  [overwritten]" if overwrite else ""))
+        return c.src_bytes, out, len(c.data), line
+
+    def _details(self, path: Path) -> Dict[str, str]:
+        return conv.details(path)
 
 
 class VideoTab(ConvertTab):
@@ -1330,7 +1475,7 @@ class VideoTab(ConvertTab):
         self.v_codec = tk.StringVar(value="hevc")
         self.v_vquality = tk.StringVar(value="balanced")
         self.v_encoder = tk.StringVar(value="cpu")
-        self.v_speed = tk.StringVar(value="medium")
+        self.v_speed = tk.StringVar(value="slow")
         self.v_audio = tk.StringVar(value="aac128")
         return {"max_short": self.v_size, "max_fps": self.v_fps, "codec": self.v_codec,
                 "quality": self.v_vquality, "encoder": self.v_encoder,
@@ -1371,7 +1516,8 @@ class VideoTab(ConvertTab):
         self.speed_box = ttk.Combobox(en, textvariable=self.v_speed, width=8,
                                       state="readonly", values=["fast", "medium", "slow"])
         self.speed_box.grid(row=1, column=1, sticky="w", pady=1)
-        ttk.Label(en, text="slow = a bit smaller, 2x time", foreground="gray").grid(
+        ttk.Label(en, text="slow: same look, 15-30 % smaller, 2.3x time",
+                  foreground="gray").grid(
             row=2, column=0, columnspan=2, sticky="w")
 
         au = ttk.LabelFrame(c, text="Audio (AAC, copied if already smaller)")
@@ -1399,7 +1545,7 @@ class VideoTab(ConvertTab):
             max_short=pick(self.v_size, [s for s, _l in self.SIZES], 720),
             max_fps=pick(self.v_fps, [f for f, _l in self.FPS], 30),
             quality=pick(self.v_vquality, vc.QUALITY_LEVELS, "balanced"),
-            speed=pick(self.v_speed, ("fast", "medium", "slow"), "medium"),
+            speed=pick(self.v_speed, ("fast", "medium", "slow"), "slow"),
             audio=pick(self.v_audio, ("copy", "aac128", "aac96"), "aac128"),
         )
 
@@ -1463,16 +1609,94 @@ class VideoTab(ConvertTab):
                             move, extra)
 
     def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
-                     opts: vc.VideoOptions, _extra: Any) -> Tuple[int, int, str]:
+                     opts: vc.VideoOptions, _extra: Any) -> Tuple[int, Path, int, str]:
         assert self.tools is not None
         out_dir = dst_root / path.parent.relative_to(src_root)
         r = vc.convert_file(self.tools, path, out_dir, opts, self.stop_event,
                             self._file_progress(i, n, path.name),
-                            conv.unique_path, conv.copy_file_times)
+                            self._target_path(path), conv.copy_file_times)
         line = (f"{path.relative_to(src_root)} -> {r.out.relative_to(dst_root)}  "
                 f"{_human(r.src_bytes)} -> {_human(r.out_bytes)} "
                 f"({r.out_bytes * 100 / max(1, r.src_bytes):.0f}%)  {r.summary}")
-        return r.src_bytes, r.out_bytes, line
+        return r.src_bytes, r.out, r.out_bytes, line
+
+    def _details(self, path: Path) -> Dict[str, str]:
+        return vc.details(self.tools, path) if self.tools is not None else {}
+
+
+class OverwriteDialog(tk.Toplevel):
+    """The target file exists: show both files and ask what to do.
+    Modal; closing the window = skip this file."""
+
+    ROWS = [("name", "File name"), ("folder", "Folder"), ("size", "Size"),
+            ("modified", "File modified"), ("taken", "Date taken"),
+            ("resolution", "Resolution"), ("duration", "Length")]
+    CHOICES = [
+        ("skip", "Skip this file", "skip_all", "Skip this and all next existing files"),
+        ("overwrite", "Overwrite this file", "overwrite_all",
+         "Overwrite this and all next existing files"),
+        ("rename", "Save with a new name", "rename_all",
+         "New name for this and all next existing files"),
+    ]
+
+    def __init__(self, master: ConvertTab, src: Dict[str, str], dst: Dict[str, str],
+                 new_name: str, done: Callable[[str], None]) -> None:
+        super().__init__(master)
+        self._done = done
+        self.title("Target file exists")
+        self.transient(master.winfo_toplevel())
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="The target file already exists. What should be done?",
+                  font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=3,
+                                                       sticky="w", pady=(0, 8))
+        ttk.Label(body, text="Source (new file)", font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=1, sticky="w", padx=8)
+        ttk.Label(body, text="Existing target file", font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=2, sticky="w", padx=8)
+        row = 2
+        for key, label in self.ROWS:
+            if key not in src and key not in dst:
+                continue
+            ttk.Label(body, text=label + ":").grid(row=row, column=0, sticky="nw")
+            for col, facts in ((1, src), (2, dst)):
+                ttk.Label(body, text=facts.get(key, "-"), wraplength=340).grid(
+                    row=row, column=col, sticky="nw", padx=8, pady=1)
+            row += 1
+        ttk.Label(body, text=f"New name would be: {new_name}", foreground="gray").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        btns.columnconfigure((0, 1), weight=1, uniform="b")
+        for r, (one, one_text, all_, all_text) in enumerate(self.CHOICES):
+            ttk.Button(btns, text=one_text, command=lambda v=one: self._choose(v)).grid(
+                row=r, column=0, sticky="ew", padx=(0, 3), pady=2)
+            ttk.Button(btns, text=all_text, command=lambda v=all_: self._choose(v)).grid(
+                row=r, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(btns, text="Cancel: stop converting", command=lambda: self._choose("stop")
+                   ).grid(row=len(self.CHOICES), column=0, columnspan=2, sticky="ew",
+                          pady=(8, 0))
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._choose("skip"))
+        self.bind("<Escape>", lambda e: self._choose("skip"))
+        self.update_idletasks()
+        top = master.winfo_toplevel()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - h) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.grab_set()
+        self.focus_force()
+
+    def _choose(self, choice: str) -> None:
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        self._done(choice)
 
 
 class PreviewWindow(tk.Toplevel):
@@ -1540,5 +1764,50 @@ class PreviewWindow(tk.Toplevel):
         self.canvas.coords(self.bg, x1 - 8, y1 - 6, x2 + 8, y2 + 6)
 
 
+_MUTEX = None
+
+
+def _already_running() -> bool:
+    """Windows: one GUI at a time (a named mutex lives as long as we do)."""
+    global _MUTEX
+    if sys.platform != "win32":
+        return False
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    _MUTEX = k32.CreateMutexW(None, False, "Local\\MediaOrganizerGUI")
+    return ctypes.get_last_error() == 183           # ERROR_ALREADY_EXISTS
+
+
+def _show_running_instance() -> None:
+    """Bring the window of the running GUI to the front."""
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    found: List[int] = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def check(hwnd, _lparam):
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n and user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if buf.value.startswith("Media Organizer ") and buf.value.endswith(" - Convert"):
+                found.append(hwnd)
+                return False
+        return True
+
+    user32.EnumWindows(proc(check), 0)
+    if found:
+        user32.ShowWindow(found[0], 9)                # SW_RESTORE
+        user32.SetForegroundWindow(found[0])
+    else:
+        user32.MessageBoxW(None, "Media Organizer is already running.",
+                           "Media Organizer", 0x40)
+
+
 def main() -> None:
+    if _already_running():
+        _show_running_instance()
+        return
     App().mainloop()
