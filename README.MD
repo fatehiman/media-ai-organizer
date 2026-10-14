@@ -253,9 +253,10 @@ and the mirrored folder structure work exactly like the Pictures tab:
 `<source>\2026\trip\VID_1.mov` → `<target>\2026\trip\VID_1.mp4`.
 
 Defaults (good for keeping memories, small storage bill):
-**720p, max 30 fps, HEVC, Balanced, CPU, AAC 128 kbps**. On the test
-phone videos (720p–1080p H.264, ~12–17 Mbit/s) this gives **10–45 %**
-of the original size, and the picture is hard to tell from the original.
+**720p, max 30 fps, HEVC, Balanced, CPU, AAC 128 kbps**. Tested on
+Samsung and iPhone videos (720p–1080p H.264, iPhone HDR HEVC, Live
+Photo clips): the result is **3–45 %** of the original size (iPhone
+HDR: ~30 %), and the picture is hard to tell from the original.
 
 - **Max size**: limits the *short* side, so a portrait video gets the
   same quality as a landscape one (720p = 1280×720 or 720×1280). Never
@@ -281,8 +282,9 @@ of the original size, and the picture is hard to tell from the original.
   files a bit smaller and takes ~2× the time.
 - **Audio**: AAC. If the source audio is already AAC at the chosen
   bitrate or lower, it is copied unchanged.
-- **HDR** (e.g. iPhone): kept as 10-bit HDR with HEVC; with H.264 it is
-  converted to normal (SDR) colors.
+- **HDR** (iPhone HDR / Dolby Vision): kept as 10-bit HDR (HLG) with
+  HEVC; with H.264 it is converted to normal (SDR) colors. iPhone Live
+  Photo clips (`.MOV` of 1–3 s) and edited `IMG_E…` videos work too.
 - **Test 10 s**: converts 10 seconds from the middle of the selected
   video (Files view) or the first video of the highlighted folder, plays
   it (with `ffplay`), and writes to the log the size the whole video

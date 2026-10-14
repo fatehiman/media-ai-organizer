@@ -349,7 +349,11 @@ def plan(info: VideoInfo, opts: VideoOptions) -> Plan:
     args = ["-map", "0:v:0"]
     if info.audio_index is not None:
         args += ["-map", f"0:{info.audio_index}"]
-    args += ["-map_metadata", "0", "-vf", vf]
+    # The source's brand tags would be copied as text keys (e.g. "qt"),
+    # which only confuses tools: the real MP4 header is written anyway.
+    args += ["-map_metadata", "0", "-metadata", "major_brand=",
+             "-metadata", "minor_version=", "-metadata", "compatible_brands=",
+             "-vf", vf]
     if fps is None:
         # Keep every frame with its own timestamp, in the source's time base
         # (the default time base rounds phone timestamps: two frames could
@@ -601,13 +605,17 @@ def verify(tools: Tools, src: Path, out: Path, info: VideoInfo, p: Plan,
         raise VideoError("output has decode errors: "
                          + " | ".join(r.stderr.strip().splitlines()[:3]))
 
-    # Colors: the source run through the same filters (scale / tone map,
-    # no encoding) must look like the output.
+    # Colors: the source, decoded on its own, must look like the output.
+    # So a wrong color range or matrix in our filters is caught too.  Only
+    # a tone map (HDR -> SDR) changes colors on purpose: then the source
+    # goes through the same filters (no encoding) first.
     if cancel.is_set():
         raise Cancelled()
     times = [info.duration * f for f in (0.2, 0.5, 0.8)]
-    ref_filter = p.vfilter.split(",")
-    ref_filter = ",".join(x for x in ref_filter if not x.startswith("fps="))
+    ref_filter = "null"
+    if p.tonemap:
+        ref_filter = ",".join(x for x in p.vfilter.split(",")
+                              if not x.startswith("fps="))
     a = _thumbs(tools, src, times, ref_filter)
     b = _thumbs(tools, out, times, "null")
     check = Check()

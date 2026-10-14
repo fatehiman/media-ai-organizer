@@ -515,7 +515,10 @@ choice below is about avoiding stutter, color errors or broken frames.
   10-bit (`yuv420p10le`, NVENC `p010le`) and the tags; Dolby Vision RPU is
   dropped (its HLG base layer plays everywhere). H.264 tone maps to SDR:
   `zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv`.
-  Only tested with a synthetic HLG clip (no real HDR sample yet).
+  Tested on real iPhone 13 Pro Max HLG / Dolby Vision 8.4 videos: tags
+  `bt2020 / arib-std-b67 / bt2020nc` kept, 10-bit, frame *k* of the
+  output = frame *k* of the source (PSNR 38.9 dB at offset 0, ~22 dB at
+  ±1), the H.264 tone map looks natural.
 - **Quality levels** → CRF / CQ (`_CRF`): Balanced = x265 CRF 26,
   x264 CRF 23, NVENC CQ 27. Measured on a busy 720p phone clip (VMAF vs
   source): x265 CRF 23 = 91.8 (70 % size), 26 = 88.8 (44 %), 28 = 85.9
@@ -545,10 +548,22 @@ choice below is about avoiding stutter, color errors or broken frames.
      -enc_time_base demux -f null -`: any stderr line fails. (Without the
      two flags the *null muxer* itself prints "non monotonically
      increasing dts" for normal phone files — a false error.)
-  5. colors: frames at 20 / 50 / 80 % of source (through the same
-     filters, minus `fps`) and output, scaled to 32×32 RGB: mean abs
-     difference ≤ 28 and channel-mean shift ≤ 14 (of 255). Normal
-     encodes measure ~0.5–2; a blue / green frame is far above.
+  5. colors: frames at 20 / 50 / 80 % of the source, decoded on its own
+     (so a wrong range / matrix in our filters is caught too; only for a
+     tone map the source goes through the same filters, minus `fps`),
+     and of the output, scaled to 32×32 RGB: mean abs difference ≤ 28
+     and channel-mean shift ≤ 14 (of 255). Normal encodes measure
+     ~0.5–1; full-range sources (iPhone Live Photo clips, edited `IMG_E`
+     files) ~2 from the full→limited range rounding; a blue / green
+     frame is far above.
+- **Brand tags**: `-metadata major_brand= minor_version= compatible_brands=`
+  so the source's brand (`qt` for iPhone MOV) is not copied as a text
+  key; the real `ftyp` is `isom` anyway.
+- **Tested sources**: Samsung (H.264 720p/1080p, VFR, `r_frame_rate`
+  120, rotation 90/180), iPhone (H.264 1080p with `mebx` data tracks,
+  HLG HEVC 10-bit Dolby Vision, Live Photo clips 1920×1440 yuvj420p with
+  PCM audio or no audio, edited HEVC yuvj420p 1060×1920, 720p HEVC from
+  apps). All pass verify with CPU HEVC, CPU H.264 and NVENC HEVC.
 - **Test 10 s**: encodes 10 s from the middle into
   `%TEMP%\MediaOrganizer\test-<name>.mp4` (old ones deleted), logs the
   estimated full size, and plays it with `ffplay` (any codec, no
