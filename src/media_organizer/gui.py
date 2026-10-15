@@ -405,6 +405,10 @@ class ConvertTab(ttk.Frame):
         self._source_pane(0)
         self._center_pane(1)
         self._target_pane(2)
+        # Widgets locked while a run is going (see _sync_states).  Preview /
+        # Convert / Stop have their own rules.
+        own = {self.btn_preview, self.btn_convert, self.btn_stop}
+        self._lockable = [w for w in self._ttk_inputs(self) if w not in own]
 
         logf = ttk.LabelFrame(self, text="Log")
         logf.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=_PAD, pady=(0, _PAD))
@@ -414,6 +418,16 @@ class ConvertTab(ttk.Frame):
         self.log.configure(yscrollcommand=sb.set)
         self.log.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
+
+    @classmethod
+    def _ttk_inputs(cls, widget: tk.Misc) -> List[tk.Misc]:
+        out: List[tk.Misc] = []
+        for child in widget.winfo_children():
+            if isinstance(child, (ttk.Button, ttk.Checkbutton, ttk.Radiobutton,
+                                  ttk.Entry, ttk.Combobox, ttk.Scale)):
+                out.append(child)
+            out.extend(cls._ttk_inputs(child))
+        return out
 
     def _path_row(self, frame: ttk.Frame, var: tk.StringVar, browse, refresh) -> None:
         entry = ttk.Entry(frame, textvariable=var)
@@ -481,9 +495,14 @@ class ConvertTab(ttk.Frame):
         self.src_list.configure(yscrollcommand=sb.set)
         self.src_list.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
-        ttk.Checkbutton(ft, text="Include subfolders", variable=self.v_subfolders,
-                        command=self._scan_files).grid(row=1, column=0, sticky="w")
-        ttk.Label(ft, text="Convert = selected files, or all listed if none selected",
+        fbar = ttk.Frame(ft)
+        fbar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Checkbutton(fbar, text="Include subfolders", variable=self.v_subfolders,
+                        command=self._scan_files).pack(side="left")
+        self.btn_diff = ttk.Button(fbar, text="Select diff", command=self._select_diff)
+        self.btn_diff.pack(side="right")
+        ttk.Label(ft, text="Convert = selected files, or all listed if none selected.  "
+                           "Select diff = files not yet in the target.",
                   foreground="gray").grid(row=2, column=0, sticky="w")
         self.src_list.bind("<Double-Button-1>", lambda e: self._preview())
         self.src_list.bind("<<ListboxSelect>>", lambda e: self._update_info())
@@ -545,14 +564,29 @@ class ConvertTab(ttk.Frame):
         except (AttributeError, tk.TclError):
             return _FOLDERS_TAB
 
+    def _busy(self) -> bool:
+        return self.worker is not None and self.worker.is_alive()
+
     def _sync_states(self) -> None:
-        self._sync_options()
-        busy = self.worker is not None and self.worker.is_alive()
+        busy = self._busy()
         scanning = "src" in self.scans
+        # While a run is going, everything that could change or break it is
+        # locked: options, paths, source / target actions, ticking, the
+        # Folders / Files switch.  The lock stays when you change the main tab.
+        if busy:
+            self._sync_options()
+        for w in self._lockable:
+            w.state(["disabled"] if busy else ["!disabled"])
+        if not busy:
+            self._sync_options()
+        for i in range(len(self.tabs.tabs())):
+            self.tabs.tab(i, state="disabled" if busy else "normal")
+        self.src_list.configure(state="disabled" if busy else "normal")
         state = "disabled" if busy or scanning else "normal"
         self.btn_convert.configure(state=state)
         self.btn_preview.configure(state=state)
         self.btn_stop.configure(state="normal" if busy else "disabled")
+        self.btn_diff.state(["disabled"] if busy or self.scans else ["!disabled"])
 
     # --- source / target selection ----------------------------------------------
 
@@ -604,7 +638,7 @@ class ConvertTab(ttk.Frame):
         self._update_info()
         self._sync_states()
 
-    def _refresh_dst(self) -> None:
+    def _refresh_dst(self, then: Optional[Callable[[], None]] = None) -> None:
         text = self.v_dst.get().strip()
         root = Path(text) if text else None
         if root is None or not root.is_dir():
@@ -618,9 +652,10 @@ class ConvertTab(ttk.Frame):
             "dst",
             lambda cancel, prog: _walk(root, self.exts, cancel, prog,
                                        on_file=lambda k, p, s: entries.append((p, s))),
-            lambda errors: self._dst_done(root, entries, errors))
+            lambda errors: self._dst_done(root, entries, errors, then))
 
-    def _dst_done(self, root: Path, entries: List[ScanEntry], errors: List[str]) -> None:
+    def _dst_done(self, root: Path, entries: List[ScanEntry], errors: List[str],
+                  then: Optional[Callable[[], None]] = None) -> None:
         entries.sort(key=lambda e: str(e[0]).lower())
         self.dst_files = [p for p, _s in entries]
         self.dst_sizes = dict(entries)
@@ -630,6 +665,8 @@ class ConvertTab(ttk.Frame):
             self.dst_list.insert(tk.END, *[self._dst_text(p, s) for p, s in entries])
         self.dst_info.configure(text=self._summary(len(entries), sum(s for _p, s in entries),
                                                    errors))
+        if then is not None:
+            then()
 
     def _dst_text(self, p: Path, size: int) -> str:
         assert self.dst_listed is not None
@@ -799,6 +836,9 @@ class ConvertTab(ttk.Frame):
         self._schedule_save()
 
     def _on_tree_click(self, event) -> Optional[str]:
+        if self._busy():
+            return "break" if "image" in self.tree.identify_element(event.x, event.y) \
+                else None
         iid = self.tree.identify_row(event.y)
         if iid and "image" in self.tree.identify_element(event.x, event.y):
             key = iid[1:]
@@ -807,6 +847,8 @@ class ConvertTab(ttk.Frame):
         return None
 
     def _on_tree_space(self, _event) -> str:
+        if self._busy():
+            return "break"
         iid = self.tree.focus()
         if iid:
             self._set_checked(iid[1:], not self._included(iid[1:]))
@@ -931,6 +973,62 @@ class ConvertTab(ttk.Frame):
         self._reselect = set()
         self._files_errors = errors
         self._update_info()
+
+    def _out_ext(self) -> str:
+        """Extension of the converted files."""
+        return ".mp4"
+
+    def _diff_categories(self) -> Set[str]:
+        """Category folders that may sit below the mirrored folder."""
+        return set()
+
+    def _select_diff(self) -> None:
+        """Files view: select only the listed files that have no converted
+        file in the target yet (same folder + name; the extension is the
+        target format; a category folder is allowed)."""
+        if self._busy() or self.scans:
+            return
+        title = "Select diff"
+        if self.src_root is None or self.files_root != self.src_root or not self.src_files:
+            messagebox.showinfo(title, f"No {self.NOUN} listed.")
+            return
+        text = self.v_dst.get().strip()
+        dst_root = Path(text) if text else None
+        if dst_root is None or not dst_root.is_dir():
+            messagebox.showinfo(title, "Choose an existing target folder first.")
+            return
+        if self.dst_listed is None or os.path.normcase(str(self.dst_listed.resolve())) \
+                != os.path.normcase(str(dst_root.resolve())):
+            self._refresh_dst(then=self._select_diff)    # read the target, then retry
+            return
+        listed = self.dst_listed
+        ext = self._out_ext().lower()
+        cats = {c.lower() for c in self._diff_categories()}
+        have: Set[Tuple[str, str]] = set()
+        for p in self.dst_files:
+            if p.suffix.lower() != ext:
+                continue
+            try:
+                parts = [x.lower() for x in p.relative_to(listed).parts[:-1]]
+            except ValueError:
+                continue
+            have.add(("/".join(parts), p.stem.lower()))
+            if parts and parts[-1] in cats:
+                have.add(("/".join(parts[:-1]), p.stem.lower()))
+        root = self.src_root
+        self.src_list.selection_clear(0, tk.END)
+        first = None
+        for i, path in enumerate(self.src_files):
+            parts = [x.lower() for x in path.relative_to(root).parts[:-1]]
+            if ("/".join(parts), path.stem.lower()) not in have:
+                self.src_list.selection_set(i)
+                first = i if first is None else first
+        n = len(self.src_list.curselection())
+        if first is not None:
+            self.src_list.see(first)
+        self._update_info()
+        self._log(f"Select diff: {n} of {len(self.src_files)} {self.NOUN} are not in "
+                  f"the target ({len(self.dst_files)} files there).")
 
     # --- info line ---------------------------------------------------------------
 
@@ -1065,6 +1163,8 @@ class ConvertTab(ttk.Frame):
         return folder / names[0] if names else None
 
     def _preview(self) -> None:
+        if self._busy():
+            return
         title = self.PREVIEW_TEXT
         if self.src_root is None:
             messagebox.showinfo(title, "Choose a source folder first.")
@@ -1088,6 +1188,8 @@ class ConvertTab(ttk.Frame):
         self._start(self._do_preview, path, self._get_options(), self._extra(), mode=None)
 
     def _convert(self) -> None:
+        if self._busy():
+            return
         root = self.src_root
         dst = self.v_dst.get().strip()
         if root is None:
@@ -1448,6 +1550,14 @@ class ImageTab(ConvertTab):
 
     def _details(self, path: Path) -> Dict[str, str]:
         return conv.details(path)
+
+    def _out_ext(self) -> str:
+        return self._get_options().ext
+
+    def _diff_categories(self) -> Set[str]:
+        if not self.v_auto.get():
+            return set()
+        return set(self.categories) | {self.cfg.fallback_folder}
 
 
 class VideoTab(ConvertTab):

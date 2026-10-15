@@ -424,6 +424,18 @@ were worse than 0.5.
 - **Output path**: `<target>/<source-relative dir>/[<category>/]<stem>.<ext>`
   in both views. A target equal to or inside the source is refused
   (otherwise outputs would be listed and converted again).
+- **Run lock**: `ConvertTab._sync_states()` disables every ttk input
+  collected in `_lockable` (all buttons / checks / radios / entries /
+  combos / scales except Preview, Convert, Stop), the Folders / Files
+  notebook tabs and the file list while `_busy()` (worker alive). Tree
+  clicks / space and `_preview` / `_convert` also check `_busy()`. The
+  lock is per tab object, so it survives a main-tab switch.
+- **Select diff** (`_select_diff`): Files view only. Builds the set of
+  `(relative dir, stem)` of target files with the output extension
+  (`_out_ext()`; `_diff_categories()` adds the category folder level
+  when Auto categorize is on) and selects the source files not in it.
+  Uses the listed target (`dst_listed`); reads it first via
+  `_refresh_dst(then=...)` if it is not the current target.
 - **Window placement**: `_center()` sizes the window (clipped to the
   screen) and centers it; used for the main and the preview window. The
   main window is built withdrawn, then centered after

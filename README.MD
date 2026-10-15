@@ -165,6 +165,13 @@ or HDD drive), so it reads the disk as little as possible.
     After the run the list is read again and the selected files stay
     selected (the ones that still exist: with Move they are gone, unless
     they failed).
+    **Select diff** (button above the list; also in the Videos tab)
+    selects only the listed files that are **not yet in the target**:
+    same folder and file name, with the target extension (`.jpg` / `.png`,
+    or `.mp4`). With *Auto categorize* on, a category folder below the
+    folder is accepted. The target list is read first if needed (or if it
+    shows another folder); if you changed the target folder outside the
+    app, press Refresh first. Then press Convert to convert only those.
   - Reading runs in the background with a progress bar ("Scanning… N
     images in M folders"); the window stays usable. Folders that can't be
     read (e.g. a failing drive) are written to the log and skipped.
@@ -203,6 +210,14 @@ or HDD drive), so it reads the disk as little as possible.
   `original -> converted` size, file size with percent, and the detected
   category.
 - **Stop** stops after the current file.
+- **Locked while running**: during a run (also Preview / Test 10 s) all
+  options, the Move / Ask checkboxes, source and target paths, Browse,
+  Scan folders, Check / Uncheck all, folder ticking, the file list, Select
+  diff, Refresh and the Folders / Files switch are disabled, because the
+  options are read once at the start and a change would not apply (or
+  would break the run). Only **Stop** works. The lock belongs to the tab
+  that runs; it stays if you switch to the other main tab and back. The
+  other main tab can still be used (it has its own run).
 - **Ask for overwrite** (off by default; in both tabs): what happens when
   the target file already exists.
   - Off: an existing target file is **overwritten without asking**; the
