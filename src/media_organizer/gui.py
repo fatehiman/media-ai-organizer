@@ -394,7 +394,7 @@ class ConvertTab(ttk.Frame):
                     pass
         self.states = {k: bool(v) for k, v in data.get("folder_states", {}).items()}
         self.states_src = data.get("folder_states_source", "")
-        # The view (Folders / Files) is not remembered: start in Folders mode.
+        self._saved_view = data.get("view", "folders")   # Folders / Files view
 
     def settings(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {}
@@ -405,6 +405,7 @@ class ConvertTab(ttk.Frame):
                 pass
         data["folder_states"] = dict(sorted(self.states.items()))
         data["folder_states_source"] = self.states_src
+        data["view"] = "files" if self._tab() == _FILES_TAB else "folders"
         return data
 
     def _schedule_save(self, *_args) -> None:
@@ -534,7 +535,7 @@ class ConvertTab(ttk.Frame):
         self.src_list.bind("<<ListboxSelect>>", lambda e: self._update_info())
         self.tabs.add(ft, text="Files")
 
-        self.tabs.select(_FOLDERS_TAB)
+        self.tabs.select(_FILES_TAB if self._saved_view == "files" else _FOLDERS_TAB)
         self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _target_pane(self, col: int) -> None:
@@ -968,6 +969,7 @@ class ConvertTab(ttk.Frame):
     # --- files view --------------------------------------------------------------
 
     def _on_tab_changed(self, _event) -> None:
+        self._schedule_save()                    # the view is remembered
         if self._tab() == _FILES_TAB and (
                 self.files_root != self.src_root
                 or self.files_recursive != self.v_subfolders.get()):

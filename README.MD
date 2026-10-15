@@ -143,8 +143,9 @@ in both. The app opens on the tab you used last.
 The GUI is made for mass conversion of big photo trees (often on a USB
 or HDD drive), so it reads the disk as little as possible.
 
-- **Source pane** has two views. The app always starts in **Folders**
-  view (this is not remembered).
+- **Source pane** has two views. The view you used last
+  (**Folders** or **Files**) is remembered, separately for Pictures and
+  Videos. The first time, it is Folders.
   - **Folders** (mass convert): shows **folders only**, never files. At
     start only the list of the source's top-level folders is read; a
     folder's subfolders are read when you expand it. Tick the folders to
@@ -267,7 +268,7 @@ or HDD drive), so it reads the disk as little as possible.
     lost on a skipped file.
 - **Settings are remembered**: source and target folders, ticked folders,
   resize / format / quality, Move, Ask for overwrite, Auto categorize and the ticked
-  categories (not the view: the app always starts in Folders view). They are saved as soon as they change (in
+  categories, and the Folders / Files view of each tab. They are saved as soon as they change (in
   `%APPDATA%\MediaOrganizer\gui.json`).
 
 Per file the order is: convert in memory → detect the category on the
