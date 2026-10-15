@@ -45,6 +45,7 @@ import io
 import json
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import threading
@@ -192,6 +193,10 @@ class App(tk.Tk):
         except (OSError, ValueError):
             data = {}
         self._save_job: Optional[str] = None
+        style = ttk.Style(self)
+        style.configure("Locked.TEntry", foreground="#707070", fieldbackground="#e8e8e8")
+        style.map("Locked.TEntry", foreground=[("readonly", "#707070")],
+                  fieldbackground=[("readonly", "#e8e8e8")])
         self.box_off, self.box_on = _checkbox_images()
 
         self.main_tabs = ttk.Notebook(self)
@@ -217,6 +222,17 @@ class App(tk.Tk):
     @property
     def tabs_list(self) -> List["ConvertTab"]:
         return [self.pictures, self.videos]
+
+    def sync_main_tabs(self) -> None:
+        """Only one tab (Pictures / Videos) may run at a time: while one runs,
+        the other main tab is disabled."""
+        try:
+            busy = [t for t in self.tabs_list if t._busy()]
+            for t in self.tabs_list:
+                self.main_tabs.tab(t, state="disabled" if busy and t not in busy
+                                   else "normal")
+        except (tk.TclError, AttributeError):
+            pass                  # called while the window is still being built
 
     def _save_settings(self) -> None:
         self._save_job = None
@@ -298,6 +314,7 @@ class ConvertTab(ttk.Frame):
         self._scan_gen = 0
         self._files_errors: List[str] = []
 
+        self._path_entries: List[ttk.Entry] = []
         self.msgs: "queue.Queue[tuple]" = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
@@ -415,7 +432,7 @@ class ConvertTab(ttk.Frame):
         self._target_pane(2)
         # Widgets locked while a run is going (see _sync_states).  Preview /
         # Convert / Stop have their own rules.
-        own = {self.btn_preview, self.btn_convert, self.btn_stop}
+        own = {self.btn_preview, self.btn_convert, self.btn_stop, *self._path_entries}
         self._lockable = [w for w in self._ttk_inputs(self) if w not in own]
 
         logf = ttk.LabelFrame(self, text="Log")
@@ -439,6 +456,7 @@ class ConvertTab(ttk.Frame):
 
     def _path_row(self, frame: ttk.Frame, var: tk.StringVar, browse, refresh) -> None:
         entry = ttk.Entry(frame, textvariable=var)
+        self._path_entries.append(entry)
         entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         entry.bind("<Return>", lambda e: refresh())
         ttk.Button(frame, text="Browse...", command=browse).grid(row=0, column=1)
@@ -587,6 +605,12 @@ class ConvertTab(ttk.Frame):
             self._sync_options()
         for w in self._lockable:
             w.state(["disabled"] if busy else ["!disabled"])
+        # Path boxes: read-only and gray (the text can still be selected and
+        # copied), not disabled.
+        for e in self._path_entries:
+            e.configure(style="Locked.TEntry" if busy else "TEntry")
+            e.state(["readonly"] if busy else ["!readonly"])
+        self.app.sync_main_tabs()
         if not busy:
             self._sync_options()
         cur = self._tab()
@@ -987,18 +1011,15 @@ class ConvertTab(ttk.Frame):
         self._files_errors = errors
         self._update_info()
 
-    def _out_ext(self) -> str:
-        """Extension of the converted files."""
-        return ".mp4"
-
     def _diff_categories(self) -> Set[str]:
         """Category folders that may sit below the mirrored folder."""
         return set()
 
     def _select_diff(self) -> None:
         """Files view: select only the listed files that have no converted
-        file in the target yet (same folder + name; the extension is the
-        target format; a category folder is allowed)."""
+        file in the target yet: same folder and file name, the extension is
+        NOT compared (IMG.MOV -> IMG.mp4, IMG.HEIC -> IMG.jpg).  A category
+        folder below the folder is allowed."""
         if self._busy() or self.scans:
             return
         title = "Select diff"
@@ -1015,12 +1036,9 @@ class ConvertTab(ttk.Frame):
             self._refresh_dst(then=self._select_diff)    # read the target, then retry
             return
         listed = self.dst_listed
-        ext = self._out_ext().lower()
         cats = {c.lower() for c in self._diff_categories()}
         have: Set[Tuple[str, str]] = set()
         for p in self.dst_files:
-            if p.suffix.lower() != ext:
-                continue
             try:
                 parts = [x.lower() for x in p.relative_to(listed).parts[:-1]]
             except ValueError:
@@ -1095,6 +1113,14 @@ class ConvertTab(ttk.Frame):
     # --- log / messages --------------------------------------------------------
 
     def _log(self, text: str) -> None:
+        # Also kept in %APPDATA%\MediaOrganizer\<images|videos>.log (the window
+        # log is lost when the app closes).
+        try:
+            path = _settings_path().with_name(f"{self.NOUN}.log")
+            with path.open("a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + text + "\n")
+        except OSError:
+            pass
         self.log.configure(state=tk.NORMAL)
         self.log.insert(tk.END, text + "\n")
         self.log.see(tk.END)
@@ -1608,6 +1634,30 @@ class ImageTab(ConvertTab):
     def _convert_one(self, path: Path, i: int, n: int, src_root: Path, dst_root: Path,
                      opts: conv.ConvertOptions,
                      ticked: Optional[Set[str]]) -> Tuple[int, Path, int, str]:
+        try:
+            return self._convert_image(path, src_root, dst_root, opts, ticked)
+        except (vc.Skipped, vc.Cancelled):
+            raise
+        except Exception as e:
+            # The file must still be in the target: copy the original.
+            out_dir = dst_root / path.parent.relative_to(src_root)
+            out = self._target_path(path)(out_dir, path.stem, path.suffix.lower())
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_name(out.name + ".part")
+            try:
+                shutil.copyfile(path, tmp)
+                os.replace(tmp, out)
+            finally:
+                tmp.unlink(missing_ok=True)
+            conv.copy_file_times(path, out)
+            size = out.stat().st_size
+            return size, out, size, (f"{path.relative_to(src_root)} -> "
+                                     f"{out.relative_to(dst_root)}  conversion failed "
+                                     f"({e}) -> original copied unchanged")
+
+    def _convert_image(self, path: Path, src_root: Path, dst_root: Path,
+                       opts: conv.ConvertOptions,
+                       ticked: Optional[Set[str]]) -> Tuple[int, Path, int, str]:
         c = conv.convert(path, opts)
         out_dir = dst_root / path.parent.relative_to(src_root)
         if ticked is not None:
@@ -1624,9 +1674,6 @@ class ImageTab(ConvertTab):
 
     def _details(self, path: Path) -> Dict[str, str]:
         return conv.details(path)
-
-    def _out_ext(self) -> str:
-        return self._get_options().ext
 
     def _diff_categories(self) -> Set[str]:
         if not self.v_auto.get():

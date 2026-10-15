@@ -431,8 +431,8 @@ were worse than 0.5.
   clicks / space and `_preview` / `_convert` also check `_busy()`. The
   lock is per tab object, so it survives a main-tab switch.
 - **Select diff** (`_select_diff`): Files view only. Builds the set of
-  `(relative dir, stem)` of target files with the output extension
-  (`_out_ext()`; `_diff_categories()` adds the category folder level
+  `(relative dir, stem)` of target files, any extension
+  (`_diff_categories()` adds the category folder level
   when Auto categorize is on) and selects the source files not in it.
   Uses the listed target (`dst_listed`); reads it first via
   `_refresh_dst(then=...)` if it is not the current target.
@@ -448,6 +448,18 @@ were worse than 0.5.
   uses it through `iconphoto`; `scripts/make_icon.py` writes
   `assets/app.ico` (+ `app.png`), which `media-organizer.spec` sets on
   both exes. Edit `icon.py`, re-run the script, rebuild.
+- **Fallbacks** (`video_convert._fallback`, `ImageTab._convert_one`):
+  any failure of the normal path (probe / encode / verify error, "not
+  smaller") ends in the target anyway: non-MP4 video → `_remux` (stream
+  copy to MP4, `-tag:v hvc1` for HEVC, audio copy or AAC, checked: duration,
+  audio, tags, GPS atom, full decode), else `_copy_original` (size
+  checked); picture → plain copy. `Cancelled` / `Skipped` pass through.
+- **Select diff** matches `(relative dir, stem)` only; the extension is
+  ignored on purpose (MOV → mp4, HEIC → jpg).
+- **Run lock, paths**: path entries are not disabled but `readonly` with
+  the `Locked.TEntry` style; `App.sync_main_tabs()` disables the other
+  main tab while one tab runs.
+- **Log file**: `_log` also appends to `%APPDATA%\MediaOrganizer\<noun>.log`.
 - **Window placement**: `_center()` sizes the window (clipped to the
   screen) and centers it; used for the main and the preview window. The
   main window is built withdrawn, then centered after

@@ -44,6 +44,7 @@ import threading
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .runtime import third_party_dir
@@ -197,6 +198,7 @@ class VideoInfo:
     audio_kbps: float
     tags: Dict[str, str]          # container tags
     size: int
+    vcodec: str = ""              # video codec name (h264, hevc, ...)
 
     @property
     def hdr(self) -> bool:
@@ -278,6 +280,7 @@ def probe(tools: Tools, path: Path) -> VideoInfo:
         audio_kbps=float(a.get("bit_rate") or 0) / 1000 if a else 0.0,
         tags={str(k): str(val) for k, val in fmt.get("tags", {}).items()},
         size=path.stat().st_size,
+        vcodec=v.get("codec_name", ""),
     )
 
 
@@ -571,6 +574,19 @@ class Check:
     color_shift: float = 0.0
 
 
+def _check_decodes(tools: Tools, out: Path, cancel: threading.Event) -> None:
+    if cancel.is_set():
+        raise Cancelled()
+    r = subprocess.run([str(tools.ffmpeg), "-v", "error", "-nostdin", "-i", str(out),
+                        "-map", "0", "-fps_mode", "passthrough", "-enc_time_base", "demux",
+                        "-f", "null", "-"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", creationflags=_NO_WINDOW | _BELOW_NORMAL)
+    if r.returncode != 0 or r.stderr.strip():
+        raise VideoError("output has decode errors: "
+                         + " | ".join(r.stderr.strip().splitlines()[:3]))
+
+
 def verify(tools: Tools, src: Path, out: Path, info: VideoInfo, p: Plan,
            cancel: threading.Event) -> Check:
     try:
@@ -605,16 +621,7 @@ def verify(tools: Tools, src: Path, out: Path, info: VideoInfo, p: Plan,
             raise VideoError(f"output has {len(out_pts)} frames, source {n_src}")
 
     # Whole file decodes without errors.
-    if cancel.is_set():
-        raise Cancelled()
-    r = subprocess.run([str(tools.ffmpeg), "-v", "error", "-nostdin", "-i", str(out),
-                        "-map", "0", "-fps_mode", "passthrough", "-enc_time_base", "demux",
-                        "-f", "null", "-"],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", creationflags=_NO_WINDOW | _BELOW_NORMAL)
-    if r.returncode != 0 or r.stderr.strip():
-        raise VideoError("output has decode errors: "
-                         + " | ".join(r.stderr.strip().splitlines()[:3]))
+    _check_decodes(tools, out, cancel)
 
     # Colors: the source, decoded on its own, must look like the output.
     # So a wrong color range or matrix in our filters is caught too.  Only
@@ -655,20 +662,99 @@ def _part_path(dst: Path) -> Path:
     return dst.with_name(dst.stem + ".part.mp4")
 
 
+def _remux(tools: Tools, src: Path, out: Path, info: VideoInfo, audio: str,
+           cancel: threading.Event, progress: Callable[[float], None]) -> None:
+    """Same picture and sound (no re-encode) in an MP4 container.  audio:
+    "copy" or "aac" (when the source audio does not fit in MP4)."""
+    args = ["-map", "0:v:0"]
+    if info.audio_index is not None:
+        args += ["-map", f"0:{info.audio_index}"]
+    args += ["-c:v", "copy"]
+    if info.vcodec == "hevc":
+        args += ["-tag:v", "hvc1"]               # what Apple players expect
+    if info.audio_index is not None:
+        args += ["-c:a", "copy"] if audio == "copy" else ["-c:a", "aac", "-b:a", "192k"]
+    args += ["-map_metadata", "0", "-movflags", "+use_metadata_tags",
+             "-max_muxing_queue_size", "4096"]
+    _encode(tools, src, out, SimpleNamespace(args=args), info.duration, cancel,  # type: ignore[arg-type]
+            progress)
+    o = probe(tools, out)
+    if abs(o.duration - info.duration) > max(1.0, info.duration * 0.01):
+        raise VideoError(f"output duration {o.duration:.1f} s, source {info.duration:.1f} s")
+    if info.audio_index is not None and o.audio_index is None:
+        raise VideoError("audio missing in output")
+    lost = [k for k, v in info.tags.items()
+            if k.lower() not in _SKIP_TAGS and o.tags.get(k) != v]
+    if lost:
+        raise VideoError("metadata would be lost: " + ", ".join(sorted(lost)[:5]))
+    if info.location:
+        add_location_atom(out, info.location)
+    _check_decodes(tools, out, cancel)
+
+
+def _copy_original(src: Path, dst_dir: Path,
+                   target_path: Callable[[Path, str, str], Path],
+                   copy_times: Callable[[Path, Path], None]) -> Path:
+    dst = target_path(dst_dir, src.stem, src.suffix.lower())
+    tmp = dst.with_name(dst.name + ".part")
+    try:
+        shutil.copyfile(src, tmp)
+        if tmp.stat().st_size != src.stat().st_size:
+            raise VideoError("copy has a different size")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    copy_times(src, dst)
+    return dst
+
+
+def _fallback(tools: Tools, src: Path, dst_dir: Path, info: Optional[VideoInfo],
+              dst: Path, cancel: threading.Event, progress: Callable[[float], None],
+              target_path: Callable[[Path, str, str], Path],
+              copy_times: Callable[[Path, Path], None], reason: str) -> Result:
+    """The normal conversion failed (or was not smaller): the file must
+    still be in the destination.  Not MP4: the same streams are rewrapped
+    into MP4 (same specs, no re-encode).  If that is not possible, or it
+    already is MP4: the original is copied unchanged."""
+    size = src.stat().st_size
+    note = f"{reason} -> "
+    if src.suffix.lower() != ".mp4" and info is not None:
+        # PCM and other odd audio is not standard in MP4: go straight to AAC.
+        ok_audio = info.audio_codec in ("aac", "mp3", "ac3", "eac3", "alac", "")
+        for audio in (("copy", "aac") if ok_audio else ("aac",)):
+            part = _part_path(dst)
+            try:
+                _remux(tools, src, part, info, audio, cancel, lambda x: progress(0.9 + 0.1 * x))
+                os.replace(part, dst)
+                copy_times(src, dst)
+                return Result(dst, size, dst.stat().st_size, True,
+                              note + "rewrapped to mp4, picture unchanged"
+                              + (", audio to AAC" if audio == "aac"
+                                 and info.audio_index is not None else ""))
+            except (VideoError, OSError):
+                continue
+            finally:
+                part.unlink(missing_ok=True)
+    out = _copy_original(src, dst_dir, target_path, copy_times)
+    return Result(out, size, size, True, note + "original copied unchanged")
+
+
 def convert_file(tools: Tools, src: Path, dst_dir: Path, opts: VideoOptions,
                  cancel: threading.Event, progress: Callable[[float], None],
                  target_path: Callable[[Path, str, str], Path],
                  copy_times: Callable[[Path, Path], None]) -> Result:
     """Convert src to dst_dir/<stem>.mp4.  target_path(folder, stem, ext)
     picks the output path (a free name, or an existing file to overwrite);
-    it may raise Skipped / Cancelled.  If the result is not smaller than
-    the source, the source is copied unchanged instead."""
-    info = probe(tools, src)
-    p = plan(info, opts)
+    it may raise Skipped / Cancelled.  If the conversion fails or the result
+    is not smaller than the source, the file is still put in the
+    destination (see _fallback), so the source is never the only copy."""
     dst = target_path(dst_dir, src.stem, ".mp4")
     dst_dir.mkdir(parents=True, exist_ok=True)
     part = _part_path(dst)
+    info: Optional[VideoInfo] = None
     try:
+        info = probe(tools, src)
+        p = plan(info, opts)
         _encode(tools, src, part, p, info.duration, cancel,
                 lambda x: progress(0.9 * x))
         if info.location:
@@ -677,21 +763,20 @@ def convert_file(tools: Tools, src: Path, dst_dir: Path, opts: VideoOptions,
         check = verify(tools, src, part, info, p, cancel)
         progress(1.0)
         out_bytes = part.stat().st_size
-        if out_bytes >= info.size:
-            part.unlink()
-            dst = target_path(dst_dir, src.stem, src.suffix.lower())
-            tmp = dst.with_name(dst.name + ".part")
-            shutil.copyfile(src, tmp)
-            os.replace(tmp, dst)
+        if out_bytes < info.size:
+            os.replace(part, dst)
             copy_times(src, dst)
-            return Result(dst, info.size, info.size, True,
-                          "converted file was not smaller: original copied")
-        os.replace(part, dst)
-        copy_times(src, dst)
-        return Result(dst, info.size, out_bytes, False,
-                      p.describe(info) + f", color diff {check.color_diff:.1f}")
+            return Result(dst, info.size, out_bytes, False,
+                          p.describe(info) + f", color diff {check.color_diff:.1f}")
+        reason = "converted file was not smaller"
+    except (Cancelled, Skipped):
+        raise
+    except (VideoError, OSError, ValueError, subprocess.SubprocessError) as e:
+        reason = "conversion failed (" + " ".join(str(e).split())[:200] + ")"
     finally:
         part.unlink(missing_ok=True)
+    return _fallback(tools, src, dst_dir, info, dst, cancel, progress, target_path,
+                     copy_times, reason)
 
 
 def details(tools: Tools, path: Path) -> Dict[str, str]:

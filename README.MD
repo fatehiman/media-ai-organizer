@@ -167,9 +167,10 @@ or HDD drive), so it reads the disk as little as possible.
     they failed).
     **Select diff** (button above the list; also in the Videos tab)
     selects only the listed files that are **not yet in the target**:
-    same folder and file name, with the target extension (`.jpg` / `.png`,
-    or `.mp4`). With *Auto categorize* on, a category folder below the
-    folder is accepted. The target list is read first if needed (or if it
+    same folder and file name. **The extension is not compared**
+    (`IMG_1.MOV` in the source counts as done when `IMG_1.mp4` is in the
+    target; `.HEIC` → `.jpg` the same). With *Auto categorize* on, a
+    category folder below the folder is accepted. The target list is read first if needed (or if it
     shows another folder); if you changed the target folder outside the
     app, press Refresh first. Then press Convert to convert only those.
   - Reading runs in the background with a progress bar ("Scanning… N
@@ -218,6 +219,22 @@ or HDD drive), so it reads the disk as little as possible.
   the part of the current file already encoded), so it is rough at the
   start and gets better. Many skipped files (already in the target) make
   it too short or too long for a while.
+- **Nothing is left only in the source**: if a file can't be converted
+  (error, a check fails, or the result is not smaller), it is still put
+  in the target, so you can delete the source:
+  - **Video, not MP4** (MOV, MKV, 3GP...): the same picture and sound are
+    rewrapped into an `.mp4` (no re-encode, same resolution / frame rate /
+    quality; metadata and GPS kept; odd audio such as PCM becomes AAC).
+  - **Video that is MP4 already, or cannot be rewrapped / is damaged**:
+    the original is copied unchanged (keeps its extension).
+  - **Picture**: the original is copied unchanged.
+  The log line says `-> rewrapped to mp4...` or `-> original copied
+  unchanged`, with the reason. Only if even that copy fails (disk full...)
+  the file is reported as an error and the source is kept.
+- **Logs are saved**: everything shown in the log is also appended to
+  `%APPDATA%\MediaOrganizer\images.log` and `videos.log` (with time), so it
+  can be read after the app is closed.
+
 - **Locked while running**: during a run (also Preview / Test 10 s) all
   options, the Move / Ask checkboxes, source and target paths, Browse,
   Scan folders, Check / Uncheck all, folder ticking, the file list, Select
@@ -225,7 +242,9 @@ or HDD drive), so it reads the disk as little as possible.
   options are read once at the start and a change would not apply (or
   would break the run). Only **Stop** works. The lock belongs to the tab
   that runs; it stays if you switch to the other main tab and back. The
-  other main tab can still be used (it has its own run).
+  **other main tab (Pictures / Videos) is disabled too**: only one run at
+  a time. The source and target path boxes are read-only and gray, not
+  disabled, so you can still select and copy the paths.
 - **Ask for overwrite** (off by default; in both tabs): what happens when
   the target file already exists.
   - Off: an existing target file is **overwritten without asking**; the
