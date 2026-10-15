@@ -39,6 +39,7 @@ Per file (one at a time, in a worker thread):
 from __future__ import annotations
 
 import bisect
+import time
 import ctypes
 import io
 import json
@@ -58,6 +59,7 @@ from . import __version__
 from . import config as config_module
 from . import convert as conv
 from . import runtime
+from .icon import make_icon
 from . import video_convert as vc
 from .trash import send_to_recycle_bin
 
@@ -175,6 +177,9 @@ class App(tk.Tk):
         super().__init__()
         self.withdraw()               # shown centered once it is built
         self.title(_TITLE)
+        # Window / taskbar icon: a photo album (drawn, no file needed).
+        self._icon = ImageTk.PhotoImage(make_icon(64))
+        self.iconphoto(True, self._icon)
         self.minsize(1000, 640)
 
         try:
@@ -296,6 +301,8 @@ class ConvertTab(ttk.Frame):
         self.msgs: "queue.Queue[tuple]" = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self._run_sizes: Dict[Path, int] = {}    # source sizes of the current run
+        self._run: Optional[Dict[str, Any]] = None   # progress of the current run
         self._poll_job: Optional[str] = None
 
         self._make_vars()
@@ -354,6 +361,7 @@ class ConvertTab(ttk.Frame):
         self.v_move = tk.BooleanVar(value=False)
         self.v_ask = tk.BooleanVar(value=False)
         self.v_status = tk.StringVar(value="Ready.")
+        self.v_sel = tk.StringVar(value="")      # selected / remaining / time left
         self.option_vars = self._make_option_vars()
 
     def _simple_vars(self) -> Dict[str, tk.Variable]:
@@ -557,6 +565,8 @@ class ConvertTab(ttk.Frame):
         self.progress = ttk.Progressbar(c, mode="determinate")
         self.progress.pack(fill="x", pady=(_PAD, 0))
         ttk.Label(c, textvariable=self.v_status, wraplength=250).pack(fill="x")
+        ttk.Label(c, textvariable=self.v_sel, wraplength=250, justify="left").pack(
+            fill="x", pady=(_PAD, 0))
 
     def _tab(self) -> int:
         try:
@@ -579,8 +589,11 @@ class ConvertTab(ttk.Frame):
             w.state(["disabled"] if busy else ["!disabled"])
         if not busy:
             self._sync_options()
+        cur = self._tab()
         for i in range(len(self.tabs.tabs())):
-            self.tabs.tab(i, state="disabled" if busy else "normal")
+            # Lock only the other view: disabling the shown one makes Tk
+            # jump to another tab.
+            self.tabs.tab(i, state="disabled" if busy and i != cur else "normal")
         self.src_list.configure(state="disabled" if busy else "normal")
         state = "disabled" if busy or scanning else "normal"
         self.btn_convert.configure(state=state)
@@ -1058,13 +1071,21 @@ class ConvertTab(ttk.Frame):
             self.src_info.configure(text=text)
             ticked = sum(1 for v in self.states.values() if v)
             self.v_status.set("Folders ticked." if ticked else "Tick folders to convert.")
+            self.v_sel.set(f"Selected: {n_t:,} {self.NOUN}, {_human(size_t)}"
+                           if self.stats_valid else "")
         else:
             if self.files_root == self.src_root:
                 self.src_info.configure(text=self._summary(
                     len(self.src_scan), sum(s for _p, s in self.src_scan),
                     self._files_errors))
-            n = len(self.src_list.curselection())
+            sel = self.src_list.curselection()
+            n = len(sel)
             self.v_status.set(f"{n} selected." if n else "Ready.")
+            if n:
+                size = sum(self.src_scan[i][1] for i in sel if i < len(self.src_scan))
+                self.v_sel.set(f"Selected: {n:,} {self.NOUN}, {_human(size)}")
+            else:
+                self.v_sel.set("")
 
     def _open_dst(self, _event) -> None:
         sel = self.dst_list.curselection()
@@ -1110,13 +1131,43 @@ class ConvertTab(ttk.Frame):
                     self._after_run(msg[1])
         except queue.Empty:
             pass
+        self._update_remain()
         self._poll_job = self.after(100, self._poll)
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        m = int(seconds / 60 + 0.5)
+        if seconds < 90:
+            return f"about {max(5, int(seconds / 5 + 0.5) * 5)} s"
+        if m < 90:
+            return f"about {m} min"
+        return f"about {m // 60} h {m % 60:02d} min"
+
+    def _update_remain(self) -> None:
+        """While a run is going: selected / remaining count and size, and the
+        time left (from the speed so far, in source bytes)."""
+        r = self._run
+        if r is None or not self._busy():
+            return
+        frac = r["frac"] * r["cur_size"]
+        done_bytes = r["done_bytes"] + frac
+        left_n = r["n"] - r["done_n"]
+        left_bytes = max(0, r["bytes"] - done_bytes)
+        elapsed = time.monotonic() - r["t0"]
+        if done_bytes > 0 and elapsed >= 3:
+            eta = self._duration(elapsed * left_bytes / done_bytes)
+        else:
+            eta = "calculating..."
+        self.v_sel.set(f"Selected: {r['n']:,} {self.NOUN}, {_human(r['bytes'])}\n"
+                       f"Remaining: {left_n:,} {self.NOUN}, {_human(left_bytes)}\n"
+                       f"Time left: {eta}")
 
     def _after_run(self, mode: Optional[str]) -> None:
         """mode: None (preview), "files" or "folders" (a convert run)."""
         if self._dialog is not None and self._dialog.winfo_exists():
             self._dialog.destroy()           # stopped while it was open
         self._dialog = None
+        self._run = None
         self._sync_states()
         if mode == "files":
             self._scan_files()
@@ -1223,6 +1274,7 @@ class ConvertTab(ttk.Frame):
             sel = self.src_list.curselection()
             files = [self.src_files[i] for i in sel] if sel else list(self.src_files)
             self._reselect = {self.src_files[i] for i in sel}
+            self._run_sizes = dict(self.src_scan)
             self._start(self._do_convert, files, root, dst_root, opts,
                         self.v_move.get(), extra, mode="files")
 
@@ -1247,13 +1299,21 @@ class ConvertTab(ttk.Frame):
             return any(k.startswith(prefix) for k in true_keys)
 
         files: List[Path] = []
+        sizes: Dict[Path, int] = {}
+        self._run_sizes = sizes
+
+        def on_file(key: str, p: Path, size: int) -> None:
+            if included(key):
+                files.append(p)
+                sizes[p] = size
+
         self.msgs.put(("status", f"Listing {self.NOUN} in the ticked folders..."))
         errors = _walk(
             src_root, self.exts, self.stop_event,
             lambda d, n: self.msgs.put(("status", f"Listing... {n:,} {self.NOUN} "
                                                   f"in {d:,} folders")),
             want_dir=want_dir,
-            on_file=lambda key, p, _s: files.append(p) if included(key) else None)
+            on_file=on_file)
         for e in errors[:20]:
             self.msgs.put(("log", f"ERROR reading {e}"))
         files.sort(key=lambda p: str(p).lower())
@@ -1265,6 +1325,16 @@ class ConvertTab(ttk.Frame):
         n = len(files)
         before = after = 0
         done = skipped = 0
+        sizes = [self._run_sizes.get(f) for f in files]
+        for k, f in enumerate(files):
+            if sizes[k] is None:
+                try:
+                    sizes[k] = f.stat().st_size
+                except OSError:
+                    sizes[k] = 0
+        run = {"n": n, "bytes": sum(sizes), "done_n": 0, "done_bytes": 0,
+               "cur_size": 0, "frac": 0.0, "t0": time.monotonic()}
+        self._run = run
         self.msgs.put(("log", f"--- Converting {n} file(s) -> {dst_root} "
                               f"({self._describe(opts, extra)}, move={move})"))
         for i, path in enumerate(files, 1):
@@ -1273,6 +1343,7 @@ class ConvertTab(ttk.Frame):
                 break
             self.msgs.put(("progress", i - 1, n))
             self.msgs.put(("status", f"{i}/{n}: {path.name}"))
+            run["cur_size"], run["frac"] = sizes[i - 1], 0.0
             try:
                 src_bytes, out, out_bytes, line = self._convert_one(
                     path, i, n, src_root, dst_root, opts, extra)
@@ -1294,6 +1365,9 @@ class ConvertTab(ttk.Frame):
                 break
             except Exception as e:
                 self.msgs.put(("log", f"ERROR {path}: {e} (source kept)"))
+            run["done_n"] = i
+            run["done_bytes"] += sizes[i - 1]
+            run["cur_size"], run["frac"] = 0, 0.0
         self.msgs.put(("progress", n, max(n, 1)))
         summary = (f"Done: {done}/{n} converted, {_human(before)} -> {_human(after)}"
                    + (f" ({after * 100 / before:.0f}%)" if before else "")
@@ -1685,6 +1759,8 @@ class VideoTab(ConvertTab):
             if pct != last[0]:
                 last[0] = pct
                 self.msgs.put(("progress", i - 1 + x, n))
+                if self._run is not None:
+                    self._run["frac"] = min(x, 1.0)
                 step = "verifying" if x >= 0.9 and x < 1 else f"{pct}%"
                 self.msgs.put(("status", f"{i}/{n}: {name}  {step}"))
         return report

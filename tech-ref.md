@@ -436,6 +436,18 @@ were worse than 0.5.
   when Auto categorize is on) and selects the source files not in it.
   Uses the listed target (`dst_listed`); reads it first via
   `_refresh_dst(then=...)` if it is not the current target.
+- **Progress / ETA**: `_do_convert` fills `self._run` (n, total bytes,
+  done count / bytes, current file size, fraction, start time; sizes from
+  `_run_sizes`: `src_scan` in Files mode, the `_walk` sizes in Folders
+  mode, else `stat`). `_poll` calls `_update_remain()` every 100 ms to
+  write `v_sel`. ETA = elapsed × left bytes / done bytes. Videos set the
+  fraction from `_file_progress`. Idle text comes from `_update_info`.
+  Only the *other* Folders / Files tab is disabled in the run lock
+  (disabling the shown tab makes Tk jump to another one).
+- **Icon**: `icon.py` draws the photo-album icon with Pillow. The window
+  uses it through `iconphoto`; `scripts/make_icon.py` writes
+  `assets/app.ico` (+ `app.png`), which `media-organizer.spec` sets on
+  both exes. Edit `icon.py`, re-run the script, rebuild.
 - **Window placement**: `_center()` sizes the window (clipped to the
   screen) and centers it; used for the main and the preview window. The
   main window is built withdrawn, then centered after

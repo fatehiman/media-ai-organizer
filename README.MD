@@ -210,6 +210,14 @@ or HDD drive), so it reads the disk as little as possible.
   `original -> converted` size, file size with percent, and the detected
   category.
 - **Stop** stops after the current file.
+- **Selected / remaining / time left** (under the progress bar, both
+  tabs): when you select files (Files view) or scan and tick folders, it
+  shows `Selected: N images, size`. During a run it shows the selected
+  total, `Remaining: N images, size`, and `Time left: about 12 min`. The
+  time is estimated from the speed so far, in source bytes (videos count
+  the part of the current file already encoded), so it is rough at the
+  start and gets better. Many skipped files (already in the target) make
+  it too short or too long for a while.
 - **Locked while running**: during a run (also Preview / Test 10 s) all
   options, the Move / Ask checkboxes, source and target paths, Browse,
   Scan folders, Check / Uncheck all, folder ticking, the file list, Select

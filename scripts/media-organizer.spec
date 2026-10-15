@@ -63,6 +63,7 @@ def exe(a, name, console):
         strip=False,
         upx=False,
         console=console,
+        icon=os.path.join(ROOT, "assets", "app.ico"),
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=None,
